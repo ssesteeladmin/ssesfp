@@ -412,12 +412,25 @@ async def create_project_from_xml(
     start_date: str = Form(""),
     due_date: str = Form(""),
 ):
-    """Create a new project and import XML in one step."""
+    """Create a new project and import XML in one step. Accepts .xml or .zip files."""
+    import zipfile
     db = SessionLocal()
     try:
-        # Read and parse XML first to get project info
         content = await file.read()
-        xml_text = content.decode("utf-8-sig")
+        xml_text = None
+        
+        # Check if it's a zip file
+        if file.filename.lower().endswith('.zip') or content[:4] == b'PK\x03\x04':
+            zf = zipfile.ZipFile(io.BytesIO(content))
+            # Find the XML file inside the zip
+            xml_files = [n for n in zf.namelist() if n.lower().endswith('.xml') and not n.startswith('__MACOSX')]
+            if not xml_files:
+                raise HTTPException(400, "No XML file found inside zip")
+            # Use the first (or largest) XML file
+            xml_files.sort(key=lambda n: zf.getinfo(n).file_size, reverse=True)
+            xml_text = zf.read(xml_files[0]).decode("utf-8-sig")
+        else:
+            xml_text = content.decode("utf-8-sig")
         parsed = parse_tekla_xml(xml_text)
         
         # Use XML project name if none provided
@@ -535,7 +548,8 @@ async def create_project_from_xml(
 
 @app.post("/api/projects/{project_id}/import-xml")
 async def import_xml(project_id: int, file: UploadFile = File(...)):
-    """Import Tekla PowerFab XML into a project."""
+    """Import Tekla PowerFab XML into a project. Accepts .xml or .zip files."""
+    import zipfile
     db = SessionLocal()
     try:
         project = db.query(Project).get(project_id)
@@ -543,7 +557,19 @@ async def import_xml(project_id: int, file: UploadFile = File(...)):
             raise HTTPException(404, "Project not found")
         
         content = await file.read()
-        xml_text = content.decode("utf-8-sig")
+        xml_text = None
+        
+        # Check if it's a zip file
+        if file.filename.lower().endswith('.zip') or content[:4] == b'PK\x03\x04':
+            zf = zipfile.ZipFile(io.BytesIO(content))
+            xml_files = [n for n in zf.namelist() if n.lower().endswith('.xml') and not n.startswith('__MACOSX')]
+            if not xml_files:
+                raise HTTPException(400, "No XML file found inside zip")
+            xml_files.sort(key=lambda n: zf.getinfo(n).file_size, reverse=True)
+            xml_text = zf.read(xml_files[0]).decode("utf-8-sig")
+        else:
+            xml_text = content.decode("utf-8-sig")
+        
         parsed = parse_tekla_xml(xml_text)
         
         assemblies_imported = 0
@@ -1358,9 +1384,21 @@ static_dir = os.path.join(os.path.dirname(__file__), "static")
 if os.path.exists(static_dir):
     app.mount("/assets", StaticFiles(directory=os.path.join(static_dir, "assets")), name="assets")
 
+@app.get("/manifest.json")
+async def serve_manifest():
+    """Serve PWA manifest."""
+    manifest_path = os.path.join(static_dir, "manifest.json")
+    if os.path.exists(manifest_path):
+        return FileResponse(manifest_path, media_type="application/json")
+    return JSONResponse({"name": "SSE Tracker", "short_name": "SSE", "display": "standalone"})
+
 @app.get("/{full_path:path}")
 async def serve_spa(full_path: str):
     """Serve React SPA for all non-API routes."""
+    # Try to serve static file first
+    file_path = os.path.join(static_dir, full_path)
+    if full_path and os.path.isfile(file_path):
+        return FileResponse(file_path)
     index = os.path.join(static_dir, "index.html")
     if os.path.exists(index):
         return FileResponse(index)
