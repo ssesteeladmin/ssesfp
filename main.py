@@ -34,6 +34,10 @@ from xml_parser import parse_tekla_xml, generate_qr_content
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./tracker.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+# Strip channel_binding param that psycopg2 doesn't support
+if "channel_binding" in DATABASE_URL:
+    import re
+    DATABASE_URL = re.sub(r'[&?]channel_binding=[^&]*', '', DATABASE_URL)
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine)
@@ -398,6 +402,136 @@ def update_project(project_id: int, data: ProjectCreate):
         db.close()
 
 # ─── XML IMPORT ──────────────────────────────────────────
+
+@app.post("/api/projects/create-from-xml")
+async def create_project_from_xml(
+    file: UploadFile = File(...),
+    project_name: str = Form(""),
+    customer_id: Optional[int] = Form(None),
+    finish_type: str = Form("None"),
+    start_date: str = Form(""),
+    due_date: str = Form(""),
+):
+    """Create a new project and import XML in one step."""
+    db = SessionLocal()
+    try:
+        # Read and parse XML first to get project info
+        content = await file.read()
+        xml_text = content.decode("utf-8-sig")
+        parsed = parse_tekla_xml(xml_text)
+        
+        # Use XML project name if none provided
+        if not project_name and parsed['project'].get('name'):
+            project_name = parsed['project']['name']
+        if not project_name:
+            project_name = file.filename.replace('.xml', '')
+        
+        # Generate job number
+        year_prefix = datetime.now().strftime("%y")
+        result = db.query(Project.job_number).filter(
+            Project.job_number.like(f"{year_prefix}-%")
+        ).all()
+        max_num = 999
+        for (jn,) in result:
+            try:
+                num = int(jn.split("-")[1])
+                if num > max_num:
+                    max_num = num
+            except:
+                pass
+        job_number = f"{year_prefix}-{max_num + 1}"
+        
+        # Create project
+        p = Project(
+            job_number=job_number,
+            project_name=project_name,
+            customer_id=customer_id if customer_id and customer_id > 0 else None,
+            finish_type=finish_type,
+            start_date=date.fromisoformat(start_date) if start_date else None,
+            due_date=date.fromisoformat(due_date) if due_date else None,
+        )
+        db.add(p)
+        db.flush()
+        
+        # Now import XML data into the project
+        assemblies_imported = 0
+        parts_imported = 0
+        drawings_imported = 0
+        
+        for dwg_data in parsed['drawings']:
+            dwg = Drawing(
+                project_id=p.id,
+                drawing_number=dwg_data['number'],
+                drawing_title=dwg_data.get('title', ''),
+                category=dwg_data.get('category', ''),
+                current_revision=dwg_data.get('revision_number', '0'),
+                revision_description=dwg_data.get('revision_description', ''),
+                date_detailed=date.fromisoformat(dwg_data['date_detailed']) if dwg_data.get('date_detailed') else None,
+                date_revised=date.fromisoformat(dwg_data['date_revised']) if dwg_data.get('date_revised') else None,
+                model_ref=dwg_data.get('model_ref', ''),
+            )
+            db.add(dwg)
+            drawings_imported += 1
+        
+        for asm_data in parsed['assemblies']:
+            main = asm_data.get('main_member')
+            asm = Assembly(
+                project_id=p.id,
+                assembly_id_tekla=asm_data['assembly_id'],
+                model_ref=asm_data.get('model_ref', ''),
+                assembly_mark=asm_data['mark'],
+                assembly_name=asm_data.get('name', ''),
+                assembly_quantity=asm_data['quantity'],
+                assembly_length_mm=asm_data.get('length_mm', 0),
+                drawing_number=asm_data.get('drawing_number', ''),
+                sequence_number=asm_data.get('sequence_number', 0),
+                sequence_lot_qty=asm_data.get('sequence_lot_qty', 0),
+                finish_type=finish_type,
+                current_station="Detailing",
+            )
+            db.add(asm)
+            db.flush()
+            asm.qr_code_data = generate_qr_content(asm_data['mark'], job_number, asm.id)
+            assemblies_imported += 1
+            
+            for part_data in asm_data['parts']:
+                part = Part(
+                    assembly_id=asm.id,
+                    part_id_tekla=part_data['part_id'],
+                    model_ref=part_data.get('model_ref', ''),
+                    part_mark=part_data.get('part_mark', ''),
+                    is_main_member=part_data['is_main_member'],
+                    quantity=part_data['quantity'],
+                    shape=part_data['shape'],
+                    dimensions=part_data['dimensions'],
+                    grade=part_data['grade'],
+                    length_inches=part_data.get('length_inches', 0),
+                    length_display=part_data.get('length_display', ''),
+                    is_hardware=part_data['is_hardware'],
+                    remark=part_data.get('remark', ''),
+                    pay_category=part_data.get('pay_category', ''),
+                )
+                db.add(part)
+                parts_imported += 1
+        
+        db.commit()
+        db.refresh(p)
+        
+        return {
+            "success": True,
+            "project_id": p.id,
+            "job_number": job_number,
+            "project_name": project_name,
+            "assemblies_imported": assemblies_imported,
+            "parts_imported": parts_imported,
+            "drawings_imported": drawings_imported,
+            "summary": parsed['summary']
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Import error: {str(e)}")
+    finally:
+        db.close()
 
 @app.post("/api/projects/{project_id}/import-xml")
 async def import_xml(project_id: int, file: UploadFile = File(...)):
