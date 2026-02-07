@@ -379,3 +379,132 @@ class AuditLog(Base):
     __table_args__ = (
         Index("idx_audit_table_record", "table_name", "record_id"),
     )
+
+# ─── INVENTORY ───────────────────────────────────────────
+
+class Inventory(Base):
+    __tablename__ = "tracker_inventory"
+    id = Column(Integer, primary_key=True)
+    shape = Column(String(20), nullable=False)
+    dimensions = Column(String(100), nullable=False)
+    grade = Column(String(50), nullable=False)
+    length_inches = Column(Float)
+    length_display = Column(String(50))
+    quantity = Column(Integer, default=1)
+    location = Column(String(100))  # Rack, Bay, Yard location
+    heat_number = Column(String(100))
+    po_reference = Column(String(100))
+    date_received = Column(Date)
+    reserved_for_project = Column(Integer, ForeignKey("tracker_projects.id"), nullable=True)
+    notes = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+# ─── STOCK LENGTH CONFIG ─────────────────────────────────
+
+class StockLengthConfig(Base):
+    __tablename__ = "tracker_stock_lengths"
+    id = Column(Integer, primary_key=True)
+    shape_category = Column(String(20), nullable=False)  # W, HSS, L, C, PL, etc
+    length_feet = Column(Float, nullable=False)
+    is_active = Column(Boolean, default=True)
+    notes = Column(String(255))
+
+# ─── RFQ (Request for Quote) ─────────────────────────────
+
+class RFQ(Base):
+    __tablename__ = "tracker_rfqs"
+    id = Column(Integer, primary_key=True)
+    rfq_number = Column(String(50), unique=True)
+    project_id = Column(Integer, ForeignKey("tracker_projects.id"))
+    status = Column(String(50), default="Draft")  # Draft, Sent, Quoted, Ordered
+    created_at = Column(DateTime, default=datetime.utcnow)
+    sent_date = Column(Date)
+    due_date = Column(Date)
+    notes = Column(Text)
+    items = relationship("RFQItem", back_populates="rfq", cascade="all, delete-orphan")
+
+class RFQItem(Base):
+    __tablename__ = "tracker_rfq_items"
+    id = Column(Integer, primary_key=True)
+    rfq_id = Column(Integer, ForeignKey("tracker_rfqs.id"))
+    shape = Column(String(20))
+    dimensions = Column(String(100))
+    grade = Column(String(50))
+    length_feet = Column(Float)
+    quantity = Column(Integer, default=1)
+    total_feet = Column(Float)
+    description = Column(String(500))
+    quoted_price = Column(Float)
+    quoted_by = Column(String(255))
+    selected = Column(Boolean, default=False)
+    rfq = relationship("RFQ", back_populates="items")
+
+# ─── TRANSMITTALS ────────────────────────────────────────
+
+class Transmittal(Base):
+    __tablename__ = "tracker_transmittals"
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("tracker_projects.id"))
+    transmittal_number = Column(String(50))
+    to_company_id = Column(Integer, ForeignKey("tracker_companies.id"))
+    to_contact = Column(String(255))
+    to_email = Column(String(255))
+    from_name = Column(String(255), default="SSE Steel")
+    subject = Column(String(500))
+    message = Column(Text)
+    items_description = Column(Text)  # What's being transmitted
+    drawing_numbers = Column(Text)    # Comma-separated drawing numbers
+    action_required = Column(String(100))  # For Review, For Approval, For Construction, For Record
+    status = Column(String(50), default="Draft")  # Draft, Sent, Acknowledged
+    sent_date = Column(DateTime)
+    acknowledged_date = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+# ─── RFI (Request for Information) ───────────────────────
+
+class RFI(Base):
+    __tablename__ = "tracker_rfis"
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("tracker_projects.id"))
+    rfi_number = Column(String(50))
+    subject = Column(String(500))
+    question = Column(Text, nullable=False)
+    response = Column(Text)
+    drawing_reference = Column(String(255))
+    detail_reference = Column(String(255))
+    spec_reference = Column(String(255))
+    submitted_by = Column(String(255), default="SSE Steel")
+    submitted_to = Column(String(255))
+    to_company_id = Column(Integer, ForeignKey("tracker_companies.id"))
+    to_email = Column(String(255))
+    priority = Column(String(50), default="Normal")  # Low, Normal, High, Urgent
+    status = Column(String(50), default="Draft")  # Draft, Sent, Responded, Closed
+    date_submitted = Column(DateTime)
+    date_required = Column(Date)
+    date_responded = Column(DateTime)
+    impact_cost = Column(Boolean, default=False)
+    impact_schedule = Column(Boolean, default=False)
+    notes = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+# ─── CHANGE ORDERS ───────────────────────────────────────
+
+class ChangeOrder(Base):
+    __tablename__ = "tracker_change_orders"
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("tracker_projects.id"))
+    co_number = Column(String(50))
+    title = Column(String(500))
+    description = Column(Text)
+    reason = Column(String(255))  # Design Change, Field Condition, Owner Request, Error/Omission
+    drawing_references = Column(Text)
+    rfi_reference = Column(String(50))  # Related RFI number
+    cost_impact = Column(Float, default=0)
+    schedule_impact_days = Column(Integer, default=0)
+    weight_change_lbs = Column(Float, default=0)
+    status = Column(String(50), default="Draft")  # Draft, Submitted, Approved, Rejected, Completed
+    submitted_date = Column(Date)
+    approved_date = Column(Date)
+    approved_by = Column(String(255))
+    notes = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)

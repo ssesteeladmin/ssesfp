@@ -25,9 +25,12 @@ from models import (
     Base, Company, Contact, Project, ProjectContact,
     Drawing, DrawingRevision, Assembly, Part,
     ScanEvent, Inspection, Shipment, ShipmentItem,
-    PurchaseOrder, POItem, AuditLog
+    PurchaseOrder, POItem, AuditLog,
+    Inventory, StockLengthConfig, RFQ, RFQItem,
+    Transmittal, RFI, ChangeOrder
 )
 from xml_parser import parse_tekla_xml, generate_qr_content
+from routes_phase2 import router as phase2_router, set_session
 
 # ─── CONFIG ──────────────────────────────────────────────
 
@@ -59,6 +62,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Register Phase 2 routes
+set_session(SessionLocal)
+app.include_router(phase2_router)
 
 def get_db():
     db = SessionLocal()
@@ -1106,7 +1113,9 @@ def list_drawings(project_id: int, category: Optional[str] = None):
             "title": d.drawing_title,
             "category": d.category,
             "revision": d.current_revision,
+            "revision_status": d.revision_status or "IFC",
             "revision_description": d.revision_description,
+            "has_pdf": bool(d.pdf_data),
             "date_detailed": d.date_detailed.isoformat() if d.date_detailed else None,
             "date_revised": d.date_revised.isoformat() if d.date_revised else None,
         } for d in q.order_by(Drawing.drawing_number).all()]
