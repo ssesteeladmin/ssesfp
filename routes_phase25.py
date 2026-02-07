@@ -23,7 +23,7 @@ from models_phase25 import (
     DocumentPacket, PacketAttachment,
     generate_barcode
 )
-from nesting import solve_nesting
+# from nesting import solve_nesting  # not used, nesting is inline
 
 router = APIRouter(prefix="/api/v2", tags=["phase25"])
 
