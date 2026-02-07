@@ -728,15 +728,32 @@ def list_assemblies(
         result = []
         for a in assemblies:
             d = _assembly_dict(a)
-            # Get main member info
-            main = db.query(Part).filter(
-                Part.assembly_id == a.id, Part.is_main_member == True
-            ).first()
-            if main:
-                d['main_shape'] = main.shape
-                d['main_dimensions'] = main.dimensions
-                d['main_grade'] = main.grade
-                d['main_length'] = main.length_display
+            # Get ALL parts for this assembly
+            parts = db.query(Part).filter(Part.assembly_id == a.id).order_by(
+                desc(Part.is_main_member), Part.part_mark
+            ).all()
+            main = None
+            d['parts'] = []
+            for p in parts:
+                if p.is_main_member:
+                    main = p
+                    d['main_shape'] = p.shape
+                    d['main_dimensions'] = p.dimensions
+                    d['main_grade'] = p.grade
+                    d['main_length'] = p.length_display
+                d['parts'].append({
+                    'id': p.id,
+                    'part_mark': p.part_mark,
+                    'is_main': p.is_main_member,
+                    'shape': p.shape,
+                    'grade': p.grade,
+                    'dimensions': p.dimensions,
+                    'length_display': p.length_display,
+                    'length_inches': p.length_inches,
+                    'quantity': p.quantity,
+                    'is_hardware': p.is_hardware,
+                })
+            d['part_count'] = len(parts)
             # Get last scan
             last_scan = db.query(ScanEvent).filter(
                 ScanEvent.assembly_id == a.id

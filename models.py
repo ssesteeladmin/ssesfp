@@ -449,7 +449,7 @@ class Transmittal(Base):
     to_company_id = Column(Integer, ForeignKey("tracker_companies.id"))
     to_contact = Column(String(255))
     to_email = Column(String(255))
-    from_name = Column(String(255), default="SSE Steel")
+    from_name = Column(String(255), default="SSE Steel Fabrication")
     subject = Column(String(500))
     message = Column(Text)
     items_description = Column(Text)  # What's being transmitted
@@ -473,7 +473,7 @@ class RFI(Base):
     drawing_reference = Column(String(255))
     detail_reference = Column(String(255))
     spec_reference = Column(String(255))
-    submitted_by = Column(String(255), default="SSE Steel")
+    submitted_by = Column(String(255), default="SSE Steel Fabrication")
     submitted_to = Column(String(255))
     to_company_id = Column(Integer, ForeignKey("tracker_companies.id"))
     to_email = Column(String(255))
