@@ -31,6 +31,8 @@ from models import (
 )
 from xml_parser import parse_tekla_xml, generate_qr_content
 from routes_phase2 import router as phase2_router, set_session
+from routes_phase25 import router as phase25_router, set_session as set_session_25
+import models_phase25  # ensure tables are created
 
 # ─── CONFIG ──────────────────────────────────────────────
 
@@ -65,7 +67,9 @@ app.add_middleware(
 
 # Register Phase 2 routes
 set_session(SessionLocal)
+set_session_25(SessionLocal)
 app.include_router(phase2_router)
+app.include_router(phase25_router)
 
 def get_db():
     db = SessionLocal()

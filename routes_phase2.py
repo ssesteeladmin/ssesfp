@@ -18,7 +18,7 @@ from models import (
     Inventory, StockLengthConfig, RFQ, RFQItem,
     Transmittal, RFI, ChangeOrder, PurchaseOrder, POItem
 )
-from nesting import nest_group, CutPiece, get_stock_lengths_for, STOCK_LENGTHS
+from nesting import nest_linear, CutPiece, generate_rfq, DEFAULT_STOCK_LENGTHS
 
 router = APIRouter(prefix="/api")
 
@@ -157,16 +157,14 @@ def run_nesting(project_id: int):
             Assembly.project_id == project_id,
             Part.is_hardware == False,
             Part.length_inches > 0,
+            Part.shape != "PL",  # Skip plates for now
         ).all()
         
-        # Group by shape|dimensions|grade
-        groups = {}
+        # Build cut pieces list
+        cut_pieces = []
         for p in parts:
             asm = db.query(Assembly).get(p.assembly_id)
-            key = f"{p.shape}|{p.dimensions}|{p.grade}"
-            if key not in groups:
-                groups[key] = []
-            groups[key].append(CutPiece(
+            cut_pieces.append(CutPiece(
                 part_mark=p.part_mark,
                 assembly_mark=asm.assembly_mark if asm else "",
                 shape=p.shape,
@@ -174,78 +172,71 @@ def run_nesting(project_id: int):
                 grade=p.grade,
                 length_inches=p.length_inches,
                 quantity=p.quantity * (asm.assembly_quantity if asm else 1),
+                project_id=project_id,
             ))
         
         # Get custom stock lengths if configured
         stock_configs = db.query(StockLengthConfig).filter(
             StockLengthConfig.is_active == True
         ).all()
-        overrides = {}
-        for sc in stock_configs:
-            cat = sc.shape_category.upper()
-            if cat not in overrides:
-                overrides[cat] = []
-            overrides[cat].append(sc.length_feet)
+        
+        custom_lengths = {}
+        if stock_configs:
+            for sc in stock_configs:
+                cat = sc.shape_category.upper()
+                if cat not in custom_lengths:
+                    custom_lengths[cat] = []
+                custom_lengths[cat].append(sc.length_feet)
+        
+        stock_lengths = {**DEFAULT_STOCK_LENGTHS, **custom_lengths}
         
         # Get inventory
         inv_items = db.query(Inventory).filter(
             Inventory.quantity > 0,
             (Inventory.reserved_for_project == None) | (Inventory.reserved_for_project == project_id)
         ).all()
-        inv_dict = {}
-        for inv in inv_items:
-            ikey = f"{inv.shape}|{inv.dimensions}|{inv.grade}"
-            if ikey not in inv_dict:
-                inv_dict[ikey] = []
-            inv_dict[ikey].append({
-                "id": inv.id, "length_ft": inv.length_inches / 12 if inv.length_inches else 20,
-                "quantity": inv.quantity,
+        
+        inventory = [{
+            "id": inv.id,
+            "shape": inv.shape,
+            "dimensions": inv.dimensions,
+            "grade": inv.grade,
+            "length_inches": inv.length_inches,
+            "quantity": inv.quantity,
+        } for inv in inv_items]
+        
+        # Run nesting
+        result = nest_linear(cut_pieces, stock_lengths, inventory)
+        
+        # Format response
+        bars_data = []
+        for bar in result.bars:
+            bars_data.append({
+                "shape": bar.shape,
+                "dimensions": bar.dimensions,
+                "grade": bar.grade,
+                "stock_length_ft": round(bar.stock_length_inches / 12, 1),
+                "from_inventory": bar.from_inventory,
+                "utilization": bar.utilization,
+                "waste_inches": round(bar.waste_inches, 2),
+                "cuts": [{
+                    "part_mark": c.part_mark,
+                    "assembly_mark": c.assembly_mark,
+                    "length_inches": c.length_inches,
+                    "length_ft": round(c.length_inches / 12, 2),
+                } for c in bar.cuts]
             })
-        
-        # Run nesting per group
-        all_results = []
-        grand_summary = {"total_bars": 0, "from_inventory": 0, "to_purchase": 0,
-                         "total_stock_feet": 0, "total_used_feet": 0, "total_waste_feet": 0,
-                         "pieces_nested": 0, "purchase_list": []}
-        
-        for key, pieces in groups.items():
-            shape = pieces[0].shape
-            stock_lengths = get_stock_lengths_for(shape, overrides or None)
-            inv = inv_dict.get(key, None)
-            
-            result = nest_group(pieces, stock_lengths, inv)
-            all_results.append(result)
-            
-            s = result["summary"]
-            grand_summary["total_bars"] += s["total_bars"]
-            grand_summary["from_inventory"] += s["from_inventory"]
-            grand_summary["to_purchase"] += s["to_purchase"]
-            grand_summary["total_stock_feet"] += s["total_stock_feet"]
-            grand_summary["total_used_feet"] += s["total_used_feet"]
-            grand_summary["total_waste_feet"] += s["total_waste_feet"]
-            grand_summary["pieces_nested"] += s["pieces_nested"]
-            
-            for pl in s["purchase_list"]:
-                grand_summary["purchase_list"].append({
-                    "shape": result["shape"],
-                    "dimensions": result["dimensions"],
-                    "grade": result["grade"],
-                    "stock_length_ft": pl["stock_length_ft"],
-                    "quantity": pl["quantity"],
-                    "description": f'{result["shape"]} {result["dimensions"]} x {pl["stock_length_ft"]}\' - {result["grade"]}',
-                })
-        
-        total_sf = grand_summary["total_stock_feet"]
-        total_uf = grand_summary["total_used_feet"]
-        grand_summary["overall_utilization"] = round(total_uf / total_sf * 100, 1) if total_sf else 0
-        grand_summary["total_stock_feet"] = round(total_sf, 1)
-        grand_summary["total_used_feet"] = round(total_uf, 1)
-        grand_summary["total_waste_feet"] = round(total_sf - total_uf, 1)
         
         return {
             "success": True,
-            "groups": all_results,
-            "summary": grand_summary,
+            "bars": bars_data,
+            "summary": result.summary,
+            "unplaced": [{
+                "part_mark": u.part_mark,
+                "shape": u.shape,
+                "dimensions": u.dimensions,
+                "length_inches": u.length_inches,
+            } for u in result.unplaced],
         }
     finally:
         db.close()
@@ -259,54 +250,50 @@ def create_rfq_from_nest(project_id: int):
         if not project:
             raise HTTPException(404)
         
-        # Same nesting logic as above
+        # Run nesting first
         parts = db.query(Part).join(Assembly).filter(
             Assembly.project_id == project_id,
             Part.is_hardware == False,
             Part.length_inches > 0,
+            Part.shape != "PL",
         ).all()
         
-        groups = {}
+        cut_pieces = []
         for p in parts:
             asm = db.query(Assembly).get(p.assembly_id)
-            key = f"{p.shape}|{p.dimensions}|{p.grade}"
-            if key not in groups:
-                groups[key] = []
-            groups[key].append(CutPiece(
-                part_mark=p.part_mark, assembly_mark=asm.assembly_mark if asm else "",
-                shape=p.shape, dimensions=p.dimensions, grade=p.grade,
+            cut_pieces.append(CutPiece(
+                part_mark=p.part_mark,
+                assembly_mark=asm.assembly_mark if asm else "",
+                shape=p.shape,
+                dimensions=p.dimensions,
+                grade=p.grade,
                 length_inches=p.length_inches,
                 quantity=p.quantity * (asm.assembly_quantity if asm else 1),
+                project_id=project_id,
             ))
         
-        purchase_list = []
-        for key, pieces in groups.items():
-            shape = pieces[0].shape
-            stock_lengths = get_stock_lengths_for(shape)
-            result = nest_group(pieces, stock_lengths)
-            for pl in result["summary"]["purchase_list"]:
-                purchase_list.append({
-                    "shape": result["shape"], "dimensions": result["dimensions"],
-                    "grade": result["grade"], "stock_length_ft": pl["stock_length_ft"],
-                    "quantity": pl["quantity"],
-                    "description": f'{result["shape"]} {result["dimensions"]} x {pl["stock_length_ft"]}\' - {result["grade"]}',
-                    "total_feet": pl["stock_length_ft"] * pl["quantity"],
-                })
+        nest_result = nest_linear(cut_pieces)
+        rfq_items = generate_rfq(nest_result, project.project_name)
         
         # Create RFQ record
         count = db.query(RFQ).filter(RFQ.project_id == project_id).count()
         rfq = RFQ(
             rfq_number=f"{project.job_number}-RFQ{count + 1:02d}",
-            project_id=project_id, status="Draft",
+            project_id=project_id,
+            status="Draft",
         )
         db.add(rfq)
         db.flush()
         
-        for item in purchase_list:
+        for item in rfq_items:
             ri = RFQItem(
-                rfq_id=rfq.id, shape=item["shape"], dimensions=item["dimensions"],
-                grade=item["grade"], length_feet=item["stock_length_ft"],
-                quantity=item["quantity"], total_feet=item["total_feet"],
+                rfq_id=rfq.id,
+                shape=item["shape"],
+                dimensions=item["dimensions"],
+                grade=item["grade"],
+                length_feet=item["length_ft"],
+                quantity=item["quantity"],
+                total_feet=item["total_feet"],
                 description=item["description"],
             )
             db.add(ri)
