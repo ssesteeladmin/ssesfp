@@ -23,7 +23,7 @@ from models_phase25 import (
     DocumentPacket, PacketAttachment,
     generate_barcode
 )
-# from nesting import solve_nesting
+# nesting is handled inline in run_nest endpoint
 
 router = APIRouter(prefix="/api/v2", tags=["phase25"])
 
@@ -117,6 +117,52 @@ def delete_vendor(vendor_id: int):
         v.active = False
         db.commit()
         return {"success": True}
+    finally:
+        db.close()
+
+
+@router.post("/vendors/import-csv")
+async def import_vendors_csv(file: UploadFile = File(...)):
+    """Bulk import vendors from CSV. Expected columns: Name, Contact, Address, City, State, Zip, Phone, Fax, Email, Terms"""
+    import csv, io as iomod
+    db = get_db()
+    try:
+        content = await file.read()
+        text = content.decode("utf-8-sig")
+        reader = csv.DictReader(iomod.StringIO(text))
+        
+        imported = 0
+        skipped = 0
+        for row in reader:
+            # Flexible column matching - try common header variations
+            name = row.get("Name") or row.get("name") or row.get("Company") or row.get("company") or row.get("Vendor") or row.get("vendor") or ""
+            if not name.strip():
+                skipped += 1
+                continue
+            
+            # Check if vendor already exists
+            existing = db.query(Vendor).filter(Vendor.name == name.strip()).first()
+            if existing:
+                skipped += 1
+                continue
+            
+            v = Vendor(
+                name=name.strip(),
+                contact_name=(row.get("Contact") or row.get("contact_name") or row.get("ContactName") or "").strip(),
+                address_line1=(row.get("Address") or row.get("address") or row.get("Address1") or "").strip(),
+                city=(row.get("City") or row.get("city") or "").strip(),
+                state=(row.get("State") or row.get("state") or "").strip(),
+                zip_code=(row.get("Zip") or row.get("zip") or row.get("ZipCode") or row.get("zip_code") or "").strip(),
+                phone=(row.get("Phone") or row.get("phone") or "").strip(),
+                fax=(row.get("Fax") or row.get("fax") or "").strip(),
+                email=(row.get("Email") or row.get("email") or "").strip(),
+                default_terms=(row.get("Terms") or row.get("terms") or "Net 45 days").strip(),
+            )
+            db.add(v)
+            imported += 1
+        
+        db.commit()
+        return {"imported": imported, "skipped": skipped}
     finally:
         db.close()
 
@@ -600,7 +646,7 @@ def list_rfqs(project_id: int):
         result = []
         for r in rfqs:
             vendor = db.query(Vendor).get(r.vendor_id) if r.vendor_id else None
-            items = db.query(RFQItemv2).filter(RFQItemv2.rfq_id == r.id, RFQItemv2.excluded == False).all()
+            items = db.query(RFQItemv2).filter(RFQItemv2.rfq_id == r.id, or_(RFQItemv2.excluded == False, RFQItemv2.excluded.is_(None))).all()
             result.append({
                 "id": r.id,
                 "rfq_number": r.rfq_number,
@@ -746,7 +792,7 @@ def convert_rfq_to_po(rfq_id: int, ordered_by: str = Form("")):
         # Copy non-excluded items
         rfq_items = db.query(RFQItemv2).filter(
             RFQItemv2.rfq_id == rfq.id,
-            RFQItemv2.excluded == False,
+            or_(RFQItemv2.excluded == False, RFQItemv2.excluded.is_(None)),
         ).order_by(RFQItemv2.line_number).all()
 
         line = 0

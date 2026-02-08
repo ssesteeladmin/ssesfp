@@ -1163,23 +1163,18 @@ async def upload_drawing_pdf(drawing_id: int, file: UploadFile = File(...)):
 @app.get("/api/drawings/{drawing_id}/pdf")
 def get_drawing_pdf(drawing_id: int):
     """Get the PDF for a drawing."""
+    from starlette.responses import StreamingResponse
     db = SessionLocal()
     try:
         d = db.query(Drawing).get(drawing_id)
         if not d or not d.pdf_data:
             raise HTTPException(404, "PDF not found")
-        import io
         pdf_bytes = base64.b64decode(d.pdf_data)
-        return FileResponse(
+        return StreamingResponse(
             io.BytesIO(pdf_bytes),
             media_type="application/pdf",
-            filename=f"{d.drawing_number}.pdf",
+            headers={"Content-Disposition": f'inline; filename="{d.drawing_number}.pdf"'}
         )
-    except HTTPException:
-        raise
-    except Exception:
-        # Fallback: return as JSON with base64
-        return JSONResponse({"pdf_data": d.pdf_data, "drawing_number": d.drawing_number})
     finally:
         db.close()
 
@@ -1223,6 +1218,55 @@ async def create_drawing(
         db.commit()
         db.refresh(d)
         return {"id": d.id, "drawing_number": d.drawing_number}
+    finally:
+        db.close()
+
+
+@app.post("/api/projects/{project_id}/drawings/batch-upload")
+async def batch_upload_drawings(project_id: int, files: List[UploadFile] = File(...)):
+    """Batch upload drawing PDFs. Matches filenames to existing drawing numbers or creates new entries."""
+    db = SessionLocal()
+    try:
+        results = []
+        for f in files:
+            content = await f.read()
+            b64 = base64.b64encode(content).decode("utf-8")
+            # Try to match filename to existing drawing number
+            # Strip extension and common suffixes
+            name = f.filename
+            base_name = name.rsplit('.', 1)[0] if '.' in name else name
+            # Try exact match on drawing_number
+            existing = db.query(Drawing).filter(
+                Drawing.project_id == project_id,
+                Drawing.drawing_number == base_name
+            ).first()
+            if existing:
+                existing.pdf_data = b64
+                results.append({"filename": name, "action": "updated", "drawing_number": existing.drawing_number})
+            else:
+                # Also try partial match (drawing numbers often have prefixes)
+                partial = db.query(Drawing).filter(
+                    Drawing.project_id == project_id,
+                    Drawing.drawing_number.ilike(f"%{base_name}%")
+                ).first()
+                if partial:
+                    partial.pdf_data = b64
+                    results.append({"filename": name, "action": "matched", "drawing_number": partial.drawing_number})
+                else:
+                    # Create new drawing entry
+                    d = Drawing(
+                        project_id=project_id,
+                        drawing_number=base_name,
+                        drawing_title=base_name,
+                        category="Assembly",
+                        current_revision="0",
+                        date_detailed=date.today(),
+                    )
+                    d.pdf_data = b64
+                    db.add(d)
+                    results.append({"filename": name, "action": "created", "drawing_number": base_name})
+        db.commit()
+        return {"uploaded": len(results), "results": results}
     finally:
         db.close()
 
