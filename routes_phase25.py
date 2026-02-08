@@ -10,7 +10,7 @@ from datetime import datetime, date
 from typing import Optional, List
 from fastapi import APIRouter, HTTPException, Form, Query, UploadFile, File
 from pydantic import BaseModel
-from sqlalchemy import desc, func
+from sqlalchemy import desc, func, or_
 from sqlalchemy.orm import Session
 
 from models import (
@@ -23,7 +23,7 @@ from models_phase25 import (
     DocumentPacket, PacketAttachment,
     generate_barcode
 )
-# from nesting import solve_nesting  # not used, nesting is inline
+from nesting import solve_nesting
 
 router = APIRouter(prefix="/api/v2", tags=["phase25"])
 
@@ -132,7 +132,7 @@ def get_nestable_parts(project_id: int, shape: Optional[str] = None):
     try:
         q = db.query(Part).join(Assembly).filter(
             Assembly.project_id == project_id,
-            Part.is_hardware == False,
+            or_(Part.is_hardware == False, Part.is_hardware.is_(None)),
         )
         if shape:
             q = q.filter(Part.shape == shape)
@@ -178,7 +178,7 @@ def get_nestable_shapes(project_id: int):
             func.sum(Part.length_inches).label('total_length')
         ).join(Assembly).filter(
             Assembly.project_id == project_id,
-            Part.is_hardware == False,
+            or_(Part.is_hardware == False, Part.is_hardware.is_(None)),
         ).group_by(Part.shape, Part.dimensions, Part.grade).all()
 
         return [{

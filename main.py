@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 import sqlalchemy as sa
-from sqlalchemy import create_engine, text, func, desc, asc
+from sqlalchemy import create_engine, text, func, desc, asc, or_
 from sqlalchemy.orm import sessionmaker, Session
 
 from models import (
@@ -1143,6 +1143,90 @@ def list_drawings(project_id: int, category: Optional[str] = None):
     finally:
         db.close()
 
+
+@app.post("/api/drawings/{drawing_id}/upload-pdf")
+async def upload_drawing_pdf(drawing_id: int, file: UploadFile = File(...)):
+    """Upload a PDF for a drawing."""
+    db = SessionLocal()
+    try:
+        d = db.query(Drawing).get(drawing_id)
+        if not d:
+            raise HTTPException(404, "Drawing not found")
+        content = await file.read()
+        d.pdf_data = base64.b64encode(content).decode("utf-8")
+        db.commit()
+        return {"success": True, "drawing_id": drawing_id, "filename": file.filename}
+    finally:
+        db.close()
+
+
+@app.get("/api/drawings/{drawing_id}/pdf")
+def get_drawing_pdf(drawing_id: int):
+    """Get the PDF for a drawing."""
+    db = SessionLocal()
+    try:
+        d = db.query(Drawing).get(drawing_id)
+        if not d or not d.pdf_data:
+            raise HTTPException(404, "PDF not found")
+        import io
+        pdf_bytes = base64.b64decode(d.pdf_data)
+        return FileResponse(
+            io.BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            filename=f"{d.drawing_number}.pdf",
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        # Fallback: return as JSON with base64
+        return JSONResponse({"pdf_data": d.pdf_data, "drawing_number": d.drawing_number})
+    finally:
+        db.close()
+
+
+@app.get("/api/drawings/{drawing_id}/pdf-data")
+def get_drawing_pdf_data(drawing_id: int):
+    """Get base64 PDF data for inline viewing."""
+    db = SessionLocal()
+    try:
+        d = db.query(Drawing).get(drawing_id)
+        if not d or not d.pdf_data:
+            raise HTTPException(404, "PDF not found")
+        return {"pdf_data": d.pdf_data, "drawing_number": d.drawing_number}
+    finally:
+        db.close()
+
+
+@app.post("/api/projects/{project_id}/drawings/create")
+async def create_drawing(
+    project_id: int,
+    drawing_number: str = Form(...),
+    drawing_title: str = Form(""),
+    category: str = Form("Assembly"),
+    file: Optional[UploadFile] = File(None),
+):
+    """Create a new drawing manually (with optional PDF upload)."""
+    db = SessionLocal()
+    try:
+        d = Drawing(
+            project_id=project_id,
+            drawing_number=drawing_number,
+            drawing_title=drawing_title,
+            category=category,
+            current_revision="0",
+            date_detailed=date.today(),
+        )
+        if file:
+            content = await file.read()
+            d.pdf_data = base64.b64encode(content).decode("utf-8")
+        db.add(d)
+        db.commit()
+        db.refresh(d)
+        return {"id": d.id, "drawing_number": d.drawing_number}
+    finally:
+        db.close()
+
+
 # ─── QR CODE / LABEL GENERATION ─────────────────────────
 
 @app.get("/api/projects/{project_id}/labels")
@@ -1212,7 +1296,7 @@ def get_cut_list(project_id: int, shape: Optional[str] = None):
     try:
         q = db.query(Part).join(Assembly).filter(
             Assembly.project_id == project_id,
-            Part.is_hardware == False,
+            or_(Part.is_hardware == False, Part.is_hardware.is_(None)),
         )
         if shape:
             q = q.filter(Part.shape == shape)
@@ -1297,7 +1381,7 @@ def generate_po_from_cutlist(project_id: int, vendor_id: int = Form(...)):
         # Get cut list grouped by material
         parts = db.query(Part).join(Assembly).filter(
             Assembly.project_id == project_id,
-            Part.is_hardware == False,
+            or_(Part.is_hardware == False, Part.is_hardware.is_(None)),
             Part.is_main_member == True,
         ).all()
         
