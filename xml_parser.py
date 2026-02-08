@@ -65,8 +65,20 @@ def parse_tekla_xml(xml_content: str) -> Dict[str, Any]:
                 'quantity': _int(asm, 'fs:AssemblyQuantity', ns),
                 'drawing_number': _text(asm, 'fs:DrawingNumber', ns),
                 'length_mm': _float_attr(asm, 'fs:AssemblyLength', ns),
+                'finish_type': '',
                 'parts': []
             }
+            
+            # Extract finish/coating - try multiple Tekla fields
+            finish = _text(asm, 'fs:Coating', ns) or _text(asm, 'fs:FinishType', ns) or _text(asm, 'fs:AssemblyCoating', ns) or _text(asm, 'fs:SurfaceTreatment', ns)
+            if not finish:
+                # Try Remark for finish codes like ROP, HDG, etc.
+                remark = _text(asm, 'fs:Remark', ns) or ''
+                for code in ('ROP', 'HDG', 'GALV', 'PAINT', 'BARE', 'PRIME', 'SANDBLAST', 'NONE'):
+                    if code in remark.upper():
+                        finish = code
+                        break
+            assembly['finish_type'] = finish or ''
             
             # Sequence
             seq = asm.find('fs:AssemblySequence', ns)

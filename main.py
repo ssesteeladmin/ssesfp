@@ -33,6 +33,7 @@ from xml_parser import parse_tekla_xml, generate_qr_content
 from routes_phase2 import router as phase2_router, set_session
 from routes_phase25 import router as phase25_router, set_session as set_session_25
 import models_phase25  # ensure tables are created
+from models_phase25 import seed_stock_config, StockConfig
 
 # ─── CONFIG ──────────────────────────────────────────────
 
@@ -52,6 +53,14 @@ SessionLocal = sessionmaker(bind=engine)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    # Seed stock library
+    db = SessionLocal()
+    try:
+        seed_stock_config(db)
+    except Exception as e:
+        print(f"⚠️ Stock config seed: {e}")
+    finally:
+        db.close()
     print("✅ Database tables created/verified")
     yield
 
@@ -419,7 +428,7 @@ async def create_project_from_xml(
     file: UploadFile = File(...),
     project_name: str = Form(""),
     customer_id: Optional[int] = Form(None),
-    finish_type: str = Form("None"),
+    finish_type: str = Form(""),
     start_date: str = Form(""),
     due_date: str = Form(""),
 ):
@@ -510,7 +519,7 @@ async def create_project_from_xml(
                 drawing_number=asm_data.get('drawing_number', ''),
                 sequence_number=asm_data.get('sequence_number', 0),
                 sequence_lot_qty=asm_data.get('sequence_lot_qty', 0),
-                finish_type=finish_type,
+                finish_type=asm_data.get('finish_type', '') or finish_type or 'None',
                 current_station="Detailing",
             )
             db.add(asm)
@@ -651,7 +660,7 @@ async def import_xml(project_id: int, file: UploadFile = File(...)):
                 drawing_number=asm_data.get('drawing_number', ''),
                 sequence_number=asm_data.get('sequence_number', 0),
                 sequence_lot_qty=asm_data.get('sequence_lot_qty', 0),
-                finish_type=project.finish_type,
+                finish_type=asm_data.get('finish_type', '') or project.finish_type or 'None',
                 current_station="Detailing",
             )
             db.add(asm)

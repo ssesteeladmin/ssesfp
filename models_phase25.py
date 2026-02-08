@@ -13,6 +13,53 @@ from models import Base
 import uuid
 
 
+# ─── STOCK SIZE LIBRARY ─────────────────────────────────────
+
+class StockConfig(Base):
+    """Standard stock sizes available for cutting/nesting."""
+    __tablename__ = "tracker_stock_config"
+    id = Column(Integer, primary_key=True)
+    shape_code = Column(String(20), nullable=False)  # W, HSS, HSSR, RT, PIPE, L, C, MC, S, PL
+    nest_type = Column(String(20), default="mult")  # mult, plate
+    available_lengths = Column(JSON)  # [20, 24, 40] in feet for linear; [{w:4,l:8},{w:5,l:10}] for plate
+    kerf_inches = Column(Float, default=0.125)  # 1/8" default
+    notes = Column(Text)
+    active = Column(Boolean, default=True)
+
+
+def seed_stock_config(db_session):
+    """Seed default SSE stock configurations if table is empty."""
+    if db_session.query(StockConfig).first():
+        return  # Already seeded
+    
+    defaults = [
+        # Linear members (Mult)
+        {"shape_code": "W", "nest_type": "mult", "available_lengths": [20, 25, 30, 35, 40, 45, 50, 55, 60], "kerf_inches": 0.125, "notes": "W Beams"},
+        {"shape_code": "HSS", "nest_type": "mult", "available_lengths": [20, 24, 40, 48], "kerf_inches": 0.125, "notes": "HSS Tube"},
+        {"shape_code": "HSSR", "nest_type": "mult", "available_lengths": [20, 24, 40, 48], "kerf_inches": 0.125, "notes": "HSS Round"},
+        {"shape_code": "RT", "nest_type": "mult", "available_lengths": [20, 24, 40, 48], "kerf_inches": 0.125, "notes": "Rectangle Tube"},
+        {"shape_code": "PIPE", "nest_type": "mult", "available_lengths": [21, 42], "kerf_inches": 0.125, "notes": "Pipe"},
+        {"shape_code": "L", "nest_type": "mult", "available_lengths": [20, 40], "kerf_inches": 0.125, "notes": "Angle"},
+        {"shape_code": "C", "nest_type": "mult", "available_lengths": [20, 25, 30, 40, 50], "kerf_inches": 0.125, "notes": "Channel"},
+        {"shape_code": "MC", "nest_type": "mult", "available_lengths": [20, 25, 30, 40, 50], "kerf_inches": 0.125, "notes": "MC Channel"},
+        {"shape_code": "S", "nest_type": "mult", "available_lengths": [20, 25, 30, 35, 40, 45, 50], "kerf_inches": 0.125, "notes": "S Beam"},
+        # Plate
+        {"shape_code": "PL", "nest_type": "plate", "available_lengths": [
+            {"w": 4, "l": 8, "thickness_max": 0.5, "notes": "1/2 and under"},
+            {"w": 5, "l": 10, "thickness_max": 0.5, "notes": "1/2 and under"},
+            {"w": 4, "l": 8, "thickness_min": 0.75, "thickness_max": 1.0, "notes": "3/4 and 1 inch"},
+            {"w": 5, "l": 10, "thickness_min": 0.75, "thickness_max": 1.0, "notes": "3/4 and 1 inch"},
+            {"w": 10, "l": 20, "thickness_min": 0.75, "thickness_max": 1.0, "notes": "3/4 and 1 inch"},
+            {"w": 4, "l": 8, "thickness_min": 1.25, "thickness_max": 2.0, "notes": "1-1/4 to 2 inch"},
+            {"w": 5, "l": 10, "thickness_min": 1.25, "thickness_max": 2.0, "notes": "1-1/4 to 2 inch"},
+        ], "kerf_inches": 0.125, "notes": "Plate stock"},
+    ]
+    
+    for cfg in defaults:
+        db_session.add(StockConfig(**cfg))
+    db_session.commit()
+
+
 # ─── VENDORS (Enhanced from Company) ──────────────────────────
 
 class Vendor(Base):

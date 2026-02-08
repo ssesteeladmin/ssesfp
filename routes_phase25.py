@@ -241,9 +241,10 @@ def get_nestable_shapes(project_id: int):
 
 class NestRequest(BaseModel):
     part_ids: List[int]
-    stock_length_inches: float = 480  # 40ft default
+    stock_length_inches: float = 0  # 0 = auto from stock config
     operator: str = ""
     machine: str = ""
+    nest_mode: str = "mult"  # mult, plate, both
 
 
 @router.post("/projects/{project_id}/run-nest")
@@ -289,6 +290,10 @@ def run_nest(project_id: int, data: NestRequest):
                 groups[key] = {"shape": p['shape'], "dimensions": p['dimensions'], "grade": p['grade'], "items": []}
             groups[key]["items"].append(p)
 
+        # Shape to stock config mapping
+        shape_map = {"W": "W", "WF": "W", "HSS": "HSS", "TS": "HSS", "HSSR": "HSSR", "RT": "RT",
+                     "PIPE": "PIPE", "L": "L", "C": "C", "MC": "MC", "S": "S", "PL": "PL", "PLATE": "PL"}
+
         # Run nesting algorithm per group
         all_results = []
         total_stock = 0
@@ -306,23 +311,60 @@ def run_nest(project_id: int, data: NestRequest):
             if not cut_lengths:
                 continue
 
-            # Simple first-fit decreasing nesting
-            stock_len = data.stock_length_inches
-            kerf = 0.25  # 1/4 inch saw kerf
+            # Get stock config for this shape
+            mapped_shape = shape_map.get(group["shape"].upper(), group["shape"].upper())
+            stock_cfg = db.query(StockConfig).filter(
+                StockConfig.shape_code == mapped_shape,
+                StockConfig.active == True
+            ).first()
 
-            indexed = sorted(enumerate(cut_lengths), key=lambda x: -x[1])
-            bins = []  # each bin: {"remaining": float, "cuts": [(idx, length)]}
+            kerf = stock_cfg.kerf_inches if stock_cfg else 0.125  # 1/8" default
 
-            for orig_idx, length in indexed:
-                placed = False
-                for b in bins:
-                    if b["remaining"] >= length + kerf:
-                        b["cuts"].append((orig_idx, length))
-                        b["remaining"] -= (length + kerf)
-                        placed = True
-                        break
-                if not placed:
-                    bins.append({"remaining": stock_len - length - kerf, "cuts": [(orig_idx, length)]})
+            # Determine stock length(s) to try
+            if data.stock_length_inches > 0:
+                # User specified a length
+                stock_lengths_to_try = [data.stock_length_inches]
+            elif stock_cfg and stock_cfg.nest_type == "mult" and stock_cfg.available_lengths:
+                # Try all available lengths and pick best yield
+                stock_lengths_to_try = [l * 12 for l in stock_cfg.available_lengths]  # convert ft to inches
+            else:
+                stock_lengths_to_try = [480]  # 40ft default
+
+            # Find the longest part to filter out stock lengths that are too short
+            max_cut = max(cut_lengths) if cut_lengths else 0
+            valid_lengths = [sl for sl in stock_lengths_to_try if sl >= max_cut + kerf]
+            if not valid_lengths:
+                valid_lengths = [max(stock_lengths_to_try)]  # fallback to longest
+
+            # Try each valid stock length, pick best yield
+            best_result = None
+            best_yield = -1
+
+            for stock_len in valid_lengths:
+                indexed = sorted(enumerate(cut_lengths), key=lambda x: -x[1])
+                bins = []
+
+                for orig_idx, length in indexed:
+                    placed = False
+                    for b in bins:
+                        if b["remaining"] >= length + kerf:
+                            b["cuts"].append((orig_idx, length))
+                            b["remaining"] -= (length + kerf)
+                            placed = True
+                            break
+                    if not placed:
+                        bins.append({"remaining": stock_len - length - kerf, "cuts": [(orig_idx, length)]})
+
+                total_material = len(bins) * stock_len
+                used_material = sum(stock_len - b["remaining"] for b in bins)
+                trial_yield = (used_material / total_material * 100) if total_material > 0 else 0
+
+                if trial_yield > best_yield:
+                    best_yield = trial_yield
+                    best_result = {"stock_len": stock_len, "bins": bins}
+
+            stock_len = best_result["stock_len"]
+            bins = best_result["bins"]
 
             total_stock += len(bins)
             for b in bins:
@@ -340,7 +382,8 @@ def run_nest(project_id: int, data: NestRequest):
                 "cut_lengths": cut_lengths,
             })
 
-        yield_pct = round((total_used / (total_stock * data.stock_length_inches) * 100), 1) if total_stock > 0 else 0
+        total_material = sum(len(r["bins"]) * r["stock_length"] for r in all_results)
+        yield_pct = round((total_used / total_material * 100), 1) if total_material > 0 else 0
 
         # Create nest run record
         nest_run = NestRun(
@@ -1317,5 +1360,117 @@ def send_packet(packet_id: int):
         p.date_sent = datetime.utcnow()
         db.commit()
         return {"success": True}
+    finally:
+        db.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  STOCK SIZE LIBRARY
+# ═══════════════════════════════════════════════════════════════
+
+from models_phase25 import StockConfig
+
+@router.get("/stock-config")
+def list_stock_config():
+    db = get_db()
+    try:
+        configs = db.query(StockConfig).filter(StockConfig.active == True).order_by(StockConfig.shape_code).all()
+        return [{
+            "id": c.id,
+            "shape_code": c.shape_code,
+            "nest_type": c.nest_type,
+            "available_lengths": c.available_lengths,
+            "kerf_inches": c.kerf_inches,
+            "notes": c.notes,
+        } for c in configs]
+    finally:
+        db.close()
+
+
+@router.get("/stock-config/for-shape/{shape_code}")
+def get_stock_for_shape(shape_code: str):
+    """Get available stock lengths for a given shape code."""
+    db = get_db()
+    try:
+        # Map shape codes to stock config
+        shape_map = {
+            "W": "W", "WF": "W",
+            "HSS": "HSS", "TS": "HSS",
+            "HSSR": "HSSR",
+            "RT": "RT",
+            "PIPE": "PIPE",
+            "L": "L",
+            "C": "C",
+            "MC": "MC",
+            "S": "S",
+            "PL": "PL", "PLATE": "PL",
+        }
+        mapped = shape_map.get(shape_code.upper(), shape_code.upper())
+        config = db.query(StockConfig).filter(
+            StockConfig.shape_code == mapped,
+            StockConfig.active == True
+        ).first()
+        if not config:
+            # Fallback - return generic lengths
+            return {"shape_code": mapped, "nest_type": "mult", "available_lengths": [20, 40], "kerf_inches": 0.125}
+        return {
+            "shape_code": config.shape_code,
+            "nest_type": config.nest_type,
+            "available_lengths": config.available_lengths,
+            "kerf_inches": config.kerf_inches,
+        }
+    finally:
+        db.close()
+
+
+class StockConfigUpdate(BaseModel):
+    shape_code: str
+    nest_type: str = "mult"
+    available_lengths: list = []
+    kerf_inches: float = 0.125
+    notes: str = ""
+
+@router.post("/stock-config")
+def create_stock_config(data: StockConfigUpdate):
+    db = get_db()
+    try:
+        c = StockConfig(**data.model_dump())
+        db.add(c)
+        db.commit()
+        db.refresh(c)
+        return {"id": c.id, "shape_code": c.shape_code}
+    finally:
+        db.close()
+
+@router.put("/stock-config/{config_id}")
+def update_stock_config(config_id: int, data: StockConfigUpdate):
+    db = get_db()
+    try:
+        c = db.query(StockConfig).get(config_id)
+        if not c:
+            raise HTTPException(404)
+        for k, v in data.model_dump().items():
+            setattr(c, k, v)
+        db.commit()
+        return {"success": True}
+    finally:
+        db.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ASSEMBLY-LEVEL UPDATES
+# ═══════════════════════════════════════════════════════════════
+
+@router.put("/assemblies/{assembly_id}/finish")
+def update_assembly_finish(assembly_id: int, finish_type: str = Form(...)):
+    """Update finish type on an individual assembly."""
+    db = get_db()
+    try:
+        a = db.query(Assembly).get(assembly_id)
+        if not a:
+            raise HTTPException(404)
+        a.finish_type = finish_type
+        db.commit()
+        return {"success": True, "finish_type": finish_type}
     finally:
         db.close()
