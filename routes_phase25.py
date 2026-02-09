@@ -288,25 +288,38 @@ def run_nest(project_id: int, data: NestRequest):
             raise HTTPException(400, "No valid parts to nest")
 
         # Group by shape+dimensions+grade for nesting
+        # For PLATES: group by thickness+grade (combine all widths onto shared sheets)
+        PLATE_SHAPES = ("PL", "PLATE")
         groups = {}
         for p in parts_to_nest:
-            key = f"{p['shape']}|{p['dimensions']}|{p['grade']}"
-            if key not in groups:
-                groups[key] = {"shape": p['shape'], "dimensions": p['dimensions'], "grade": p['grade'], "items": []}
-            groups[key]["items"].append(p)
+            if p['shape'].upper() in PLATE_SHAPES:
+                # Parse thickness from dimensions (e.g. "1/2\"X12\"" → thickness="1/2")
+                thickness_str = _extract_plate_thickness_str(p['dimensions'])
+                key = f"{p['shape']}|{thickness_str}|{p['grade']}"
+                if key not in groups:
+                    groups[key] = {"shape": p['shape'], "dimensions": thickness_str, "grade": p['grade'], "items": [], "is_plate": True}
+                # Parse the plate piece width from dimensions (part after X)
+                piece_w = _extract_plate_width(p['dimensions'])
+                if piece_w and not p.get('width_inches'):
+                    p['width_inches'] = piece_w
+                groups[key]["items"].append(p)
+            else:
+                key = f"{p['shape']}|{p['dimensions']}|{p['grade']}"
+                if key not in groups:
+                    groups[key] = {"shape": p['shape'], "dimensions": p['dimensions'], "grade": p['grade'], "items": [], "is_plate": False}
+                groups[key]["items"].append(p)
 
         # Shape to stock config mapping
         shape_map = {"W": "W", "WF": "W", "HSS": "HSS", "TS": "HSS", "HSSR": "HSSR", "RT": "RT",
                      "PIPE": "PIPE", "L": "L", "C": "C", "MC": "MC", "S": "S", "PL": "PL", "PLATE": "PL"}
 
-        PLATE_SHAPES = ("PL", "PLATE")
         all_results = []
         total_used = 0
         total_material = 0
         buy_list = []  # consolidated purchase list
 
         for key, group in groups.items():
-            is_plate = group["shape"].upper() in PLATE_SHAPES
+            is_plate = group.get("is_plate", False)
 
             # Get stock config
             mapped_shape = shape_map.get(group["shape"].upper(), group["shape"].upper())
@@ -317,17 +330,14 @@ def run_nest(project_id: int, data: NestRequest):
             kerf = stock_cfg.kerf_inches if stock_cfg else 0.125
 
             if is_plate and data.nest_mode != "mult":
-                # ═══ PLATE NESTING (2D strip packing) ═══
+                # ═══ PLATE NESTING (2D strip packing by thickness) ═══
                 plates = []
                 part_refs = []
                 for item in group["items"]:
                     for _ in range(item["quantity"]):
-                        w = item["width_inches"] or 12  # default 12" if no width
+                        w = item.get("width_inches") or _extract_plate_width(item.get("dimensions", "")) or 12
                         l = item["length_inches"] or 12
-                        # Ensure w <= l (width is shorter side)
-                        if w > l:
-                            w, l = l, w
-                        plates.append({"width": w, "length": l})
+                        plates.append({"width": w, "length": l, "part_dims": item["dimensions"]})
                         part_refs.append(item)
 
                 if not plates:
@@ -343,41 +353,63 @@ def run_nest(project_id: int, data: NestRequest):
                     sw = sheet["w"] * 12  # feet to inches
                     sl = sheet["l"] * 12
 
-                    # Strip packing: sort plates by width descending
-                    sorted_p = sorted(enumerate(plates), key=lambda x: -x[1]["width"])
+                    # Sort plates by area descending (largest first)
+                    sorted_p = sorted(enumerate(plates), key=lambda x: -(x[1]["width"] * x[1]["length"]))
                     sheets_used = []
-                    cur = {"strips": [], "y_used": 0, "stock_w": sw, "stock_l": sl}
+                    cur = {"strips": [], "y_used": 0}
 
                     for orig_idx, pl in sorted_p:
                         pw, pl_len = pl["width"], pl["length"]
                         placed = False
 
-                        # Try existing strips on current sheet
-                        for strip in cur["strips"]:
-                            if strip["x_rem"] >= pl_len + kerf and strip["h"] >= pw:
-                                strip["cuts"].append((orig_idx, pw, pl_len))
-                                strip["x_rem"] -= (pl_len + kerf)
+                        # Try both orientations
+                        orientations = [(pw, pl_len), (pl_len, pw)]
+                        for ow, ol in orientations:
+                            if ow > sw or ol > sl:
+                                continue  # doesn't fit this orientation
+
+                            # Try existing strips on current sheet
+                            for strip in cur["strips"]:
+                                if strip["x_rem"] >= ol + kerf and strip["h"] >= ow:
+                                    strip["cuts"].append((orig_idx, ow, ol))
+                                    strip["x_rem"] -= (ol + kerf)
+                                    placed = True
+                                    break
+                            if placed:
+                                break
+
+                            # New strip on current sheet
+                            if not placed and cur["y_used"] + ow + kerf <= sw:
+                                cur["strips"].append({
+                                    "h": ow, "x_rem": sl - ol - kerf,
+                                    "cuts": [(orig_idx, ow, ol)]
+                                })
+                                cur["y_used"] += ow + kerf
                                 placed = True
                                 break
 
-                        if not placed and cur["y_used"] + pw + kerf <= sw:
-                            # New strip on current sheet
-                            cur["strips"].append({
-                                "h": pw, "x_rem": sl - pl_len - kerf,
-                                "cuts": [(orig_idx, pw, pl_len)]
-                            })
-                            cur["y_used"] += pw + kerf
-                            placed = True
-
                         if not placed:
-                            # New sheet
-                            sheets_used.append(cur)
-                            cur = {
-                                "strips": [{"h": pw, "x_rem": sl - pl_len - kerf, "cuts": [(orig_idx, pw, pl_len)]}],
-                                "y_used": pw + kerf, "stock_w": sw, "stock_l": sl
-                            }
+                            # New sheet — try both orientations again
+                            for ow, ol in orientations:
+                                if ow <= sw and ol <= sl:
+                                    sheets_used.append(cur)
+                                    cur = {
+                                        "strips": [{"h": ow, "x_rem": sl - ol - kerf, "cuts": [(orig_idx, ow, ol)]}],
+                                        "y_used": ow + kerf,
+                                    }
+                                    placed = True
+                                    break
+                            if not placed:
+                                # Piece too large for any sheet — put on its own
+                                sheets_used.append(cur)
+                                cur = {
+                                    "strips": [{"h": pw, "x_rem": 0, "cuts": [(orig_idx, pw, pl_len)]}],
+                                    "y_used": pw,
+                                }
 
                     sheets_used.append(cur)
+                    # Filter out empty sheets
+                    sheets_used = [s for s in sheets_used if s["strips"] and any(strip["cuts"] for strip in s["strips"])]
 
                     total_sheet_area = len(sheets_used) * sw * sl
                     total_piece_area = sum(p["width"] * p["length"] for p in plates)
@@ -403,7 +435,7 @@ def run_nest(project_id: int, data: NestRequest):
                     "shape": group["shape"],
                     "dimensions": group["dimensions"],
                     "grade": group["grade"],
-                    "stock_desc": f"{sheet['w']}'×{sheet['l']}' PL {group['dimensions']}",
+                    "stock_desc": f"{sheet['w']}'×{sheet['l']}' PL {group['dimensions']}\"",
                     "qty": n_sheets,
                     "stock_length_ft": sheet["l"],
                     "stock_width_ft": sheet["w"],
@@ -551,9 +583,9 @@ def run_nest(project_id: int, data: NestRequest):
                         stock_index=bin_idx,
                         cut_position=cut_idx,
                         cut_length_inches=length,
-                        shape=res["shape"],
-                        dimensions=res["dimensions"],
-                        grade=res["grade"],
+                        shape=p_ref["shape"],
+                        dimensions=p_ref["dimensions"],
+                        grade=p_ref["grade"],
                         part_mark=p_ref["part_mark"],
                         assembly_mark=p_ref["assembly_mark"],
                         quantity=1,
@@ -605,7 +637,7 @@ def run_nest(project_id: int, data: NestRequest):
             "buy_list": buy_list,
             "groups": [{
                 "shape": r["shape"],
-                "dimensions": r["dimensions"],
+                "dimensions": (r["dimensions"] + '"') if r.get("is_plate") else r["dimensions"],
                 "grade": r["grade"],
                 "is_plate": r.get("is_plate", False),
                 "stock_count": len(r["bins"]),
@@ -626,21 +658,53 @@ def run_nest(project_id: int, data: NestRequest):
 
 def _parse_plate_thickness(dimensions_str):
     """Parse plate thickness from dimensions string like '1/2', '3/4', '1-1/4'."""
-    s = (dimensions_str or "").strip()
+    s = _extract_plate_thickness_str(dimensions_str)
+    return _parse_mixed_fraction(s) or 0.5
+
+
+def _extract_plate_thickness_str(dimensions_str):
+    """Extract thickness portion from plate dimensions like '1/2\"X12\"' → '1/2'."""
+    s = (dimensions_str or "").strip().replace('"', '').replace("'", "")
+    # Split on X (case-insensitive)
+    import re
+    parts = re.split(r'[xX]', s, maxsplit=1)
+    return parts[0].strip() if parts else s
+
+
+def _extract_plate_width(dimensions_str):
+    """Extract width (piece width) from plate dimensions like '1/2\"X12\"' → 12.0 inches."""
+    s = (dimensions_str or "").strip().replace('"', '').replace("'", "")
+    import re
+    parts = re.split(r'[xX]', s, maxsplit=1)
+    if len(parts) < 2:
+        return 0
+    w_str = parts[1].strip()
+    return _parse_mixed_fraction(w_str)
+
+
+def _parse_mixed_fraction(s):
+    """Parse strings like '6 1/8', '1-1/2', '14 5/8', '3/4', '12' into float."""
+    s = s.strip()
+    if not s:
+        return 0
     try:
-        if "-" in s and "/" in s:
-            # Mixed: "1-1/4" -> 1.25
-            parts = s.split("-")
-            whole = float(parts[0])
-            num, den = parts[1].split("/")
-            return whole + float(num) / float(den)
-        elif "/" in s:
+        # Try space-separated mixed: "6 1/8" or "14 5/8"
+        import re
+        m = re.match(r'^(\d+)\s+(\d+)/(\d+)$', s)
+        if m:
+            return float(m.group(1)) + float(m.group(2)) / float(m.group(3))
+        # Try dash-separated mixed: "1-1/4"
+        m = re.match(r'^(\d+)-(\d+)/(\d+)$', s)
+        if m:
+            return float(m.group(1)) + float(m.group(2)) / float(m.group(3))
+        # Try simple fraction: "3/4"
+        if "/" in s:
             num, den = s.split("/")
             return float(num) / float(den)
-        else:
-            return float(s) if s else 0.5
+        # Plain number
+        return float(s)
     except (ValueError, ZeroDivisionError):
-        return 0.5  # default
+        return 0
 
 
 def _get_plate_sheets(stock_cfg, thickness):
