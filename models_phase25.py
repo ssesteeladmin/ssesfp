@@ -406,6 +406,48 @@ class PacketAttachment(Base):
     packet = relationship("DocumentPacket", back_populates="attachments")
 
 
+class ProductionFolder(Base):
+    """A production folder groups assemblies/marks for shop floor tracking."""
+    __tablename__ = "tracker_production_folders"
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("tracker_projects.id"), nullable=False)
+    folder_number = Column(Integer, nullable=False)
+    folder_name = Column(String(200))  # e.g. "Folder 1 - Main Beams"
+    shop = Column(String(20), default="Shop 1")  # Shop 1 or Shop 2
+    station = Column(String(100), default="Yard")
+    sub_location = Column(String(200))  # e.g. "Bay 3", "Rack A"
+    status = Column(String(30), default="open")  # open, in_progress, completed
+    priority = Column(Integer, default=0)
+    assigned_to = Column(String(100))
+    completed_date = Column(DateTime, nullable=True)
+    completed_by = Column(String(100), nullable=True)
+    notes = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    items = relationship("ProductionFolderItem", back_populates="folder", cascade="all, delete-orphan")
+    __table_args__ = (
+        Index("idx_folder_project", "project_id"),
+    )
+
+
+class ProductionFolderItem(Base):
+    """Links an assembly (by mark) to a production folder."""
+    __tablename__ = "tracker_production_folder_items"
+    id = Column(Integer, primary_key=True)
+    folder_id = Column(Integer, ForeignKey("tracker_production_folders.id"), nullable=False)
+    assembly_id = Column(Integer, ForeignKey("tracker_assemblies.id"), nullable=True)
+    piece_mark = Column(String(100), nullable=False)  # e.g. "A1", "B3", "C12"
+    status = Column(String(30), default="pending")  # pending, in_progress, completed
+    station = Column(String(100))  # current station of this piece
+    completed_date = Column(DateTime, nullable=True)
+    notes = Column(Text)
+    folder = relationship("ProductionFolder", back_populates="items")
+    __table_args__ = (
+        Index("idx_folder_item_folder", "folder_id"),
+        Index("idx_folder_item_mark", "piece_mark"),
+    )
+
+
 def generate_barcode():
     """Generate a unique barcode string"""
     return f"SSE-{uuid.uuid4().hex[:8].upper()}"

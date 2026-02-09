@@ -15,7 +15,7 @@ from sqlalchemy import desc, func, or_
 from sqlalchemy.orm import Session
 
 from models import (
-    Base, Project, Assembly, Part, Drawing
+    Base, Project, Assembly, Part, Drawing, ScanEvent
 )
 from models_phase25 import (
     Vendor, NestRun, NestRunItem, NestRunDrop,
@@ -23,6 +23,7 @@ from models_phase25 import (
     RFQQuote, RFQQuoteItem,
     YardTag, DropTag, MaterialInventory,
     DocumentPacket, PacketAttachment, StockConfig,
+    ProductionFolder, ProductionFolderItem,
     generate_barcode
 )
 # nesting is handled inline in run_nest endpoint
@@ -2393,6 +2394,432 @@ def use_inventory_for_project(project_id: int, data: dict = Body(...)):
 
         db.commit()
         return {"success": True, "items_reserved": used}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  PRODUCTION FOLDERS — Shop Floor Integration
+# ═══════════════════════════════════════════════════════════════
+
+# Station hierarchy for frontend
+PRODUCTION_STATIONS = {
+    "Yard": {"color": "#78716c", "group": "Yard"},
+    "Yard - Bay 1": {"color": "#78716c", "group": "Yard"},
+    "Yard - Bay 2": {"color": "#78716c", "group": "Yard"},
+    "Yard - Bay 3": {"color": "#78716c", "group": "Yard"},
+    "Yard - Rack": {"color": "#78716c", "group": "Yard"},
+    "Plasma Plate": {"color": "#0e7490", "group": "PreProduction"},
+    "Plasma Beam Line": {"color": "#0369a1", "group": "PreProduction"},
+    "Piranha Laser": {"color": "#7c3aed", "group": "PreProduction"},
+    "Press Brake": {"color": "#6d28d9", "group": "PreProduction"},
+    "Fit": {"color": "#c026d3", "group": "Assembly/QC"},
+    "QC": {"color": "#ea580c", "group": "Assembly/QC"},
+    "Weld": {"color": "#dc2626", "group": "Assembly/QC"},
+    "CWI - Visual": {"color": "#f97316", "group": "Assembly/QC"},
+    "CWI - NDT": {"color": "#ef4444", "group": "Assembly/QC"},
+    "Prime": {"color": "#0891b2", "group": "Finish"},
+    "Galvanize": {"color": "#ca8a04", "group": "Finish"},
+    "Powder Coat": {"color": "#7c3aed", "group": "Finish"},
+    "Off Site Painting": {"color": "#a16207", "group": "Finish"},
+    "Ready to Ship": {"color": "#16a34a", "group": "Shipping"},
+    "Shipped - To Coater": {"color": "#059669", "group": "Shipping"},
+    "Shipped - To Customer": {"color": "#22c55e", "group": "Shipping"},
+    "Delivered": {"color": "#15803d", "group": "Shipping"},
+}
+
+@router.get("/stations")
+def get_stations():
+    """Return station hierarchy for frontend."""
+    return PRODUCTION_STATIONS
+
+
+class FolderCreate(BaseModel):
+    folder_number: int
+    folder_name: str = ""
+    shop: str = "Shop 1"
+    assigned_to: str = ""
+    notes: str = ""
+    piece_marks: List[str] = []
+
+
+@router.get("/projects/{project_id}/folders")
+def list_folders(project_id: int):
+    """List all production folders for a project."""
+    db = get_db()
+    try:
+        folders = db.query(ProductionFolder).filter(
+            ProductionFolder.project_id == project_id
+        ).order_by(ProductionFolder.shop, ProductionFolder.priority, ProductionFolder.folder_number).all()
+
+        result = []
+        for f in folders:
+            items = db.query(ProductionFolderItem).filter(ProductionFolderItem.folder_id == f.id).all()
+            # Enrich items with assembly data
+            enriched = []
+            for item in items:
+                asm = None
+                if item.assembly_id:
+                    asm = db.query(Assembly).get(item.assembly_id)
+                enriched.append({
+                    "id": item.id,
+                    "piece_mark": item.piece_mark,
+                    "status": item.status,
+                    "station": item.station or f.station,
+                    "completed_date": item.completed_date.isoformat() if item.completed_date else None,
+                    "assembly_id": item.assembly_id,
+                    "assembly_name": asm.assembly_name if asm else None,
+                    "assembly_qty": asm.assembly_quantity if asm else None,
+                    "current_station": asm.current_station if asm else None,
+                    "notes": item.notes,
+                })
+
+            completed_count = sum(1 for i in items if i.status == "completed")
+            result.append({
+                "id": f.id,
+                "folder_number": f.folder_number,
+                "folder_name": f.folder_name or f"Folder {f.folder_number}",
+                "shop": f.shop,
+                "station": f.station,
+                "sub_location": f.sub_location,
+                "status": f.status,
+                "priority": f.priority,
+                "assigned_to": f.assigned_to,
+                "completed_date": f.completed_date.isoformat() if f.completed_date else None,
+                "completed_by": f.completed_by,
+                "notes": f.notes,
+                "items": enriched,
+                "total_items": len(items),
+                "completed_items": completed_count,
+            })
+        return result
+    finally:
+        db.close()
+
+
+@router.post("/projects/{project_id}/folders")
+def create_folder(project_id: int, data: FolderCreate):
+    """Create a production folder and assign piece marks."""
+    db = get_db()
+    try:
+        folder = ProductionFolder(
+            project_id=project_id,
+            folder_number=data.folder_number,
+            folder_name=data.folder_name or f"Folder {data.folder_number}",
+            shop=data.shop,
+            assigned_to=data.assigned_to,
+            notes=data.notes,
+        )
+        db.add(folder)
+        db.flush()
+
+        for mark in data.piece_marks:
+            mark = mark.strip()
+            if not mark:
+                continue
+            # Try to find the assembly by mark
+            asm = db.query(Assembly).filter(
+                Assembly.project_id == project_id,
+                Assembly.assembly_mark.ilike(f"%{mark}%")
+            ).first()
+
+            item = ProductionFolderItem(
+                folder_id=folder.id,
+                assembly_id=asm.id if asm else None,
+                piece_mark=mark,
+                status="pending",
+            )
+            db.add(item)
+
+        db.commit()
+        db.refresh(folder)
+        return {"success": True, "folder_id": folder.id, "items_added": len(data.piece_marks)}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+@router.put("/folders/{folder_id}")
+def update_folder(folder_id: int, data: FolderCreate):
+    """Update folder details."""
+    db = get_db()
+    try:
+        folder = db.query(ProductionFolder).get(folder_id)
+        if not folder:
+            raise HTTPException(404, "Folder not found")
+        folder.folder_name = data.folder_name or f"Folder {data.folder_number}"
+        folder.shop = data.shop
+        folder.assigned_to = data.assigned_to
+        folder.notes = data.notes
+        db.commit()
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+@router.post("/folders/{folder_id}/add-marks")
+def add_marks_to_folder(folder_id: int, data: dict = Body(...)):
+    """Add piece marks to an existing folder. data: {marks: ['A1','A2']}"""
+    db = get_db()
+    try:
+        folder = db.query(ProductionFolder).get(folder_id)
+        if not folder:
+            raise HTTPException(404, "Folder not found")
+
+        marks = data.get("marks", [])
+        added = 0
+        for mark in marks:
+            mark = mark.strip()
+            if not mark:
+                continue
+            # Check if mark already in this folder
+            existing = db.query(ProductionFolderItem).filter(
+                ProductionFolderItem.folder_id == folder_id,
+                ProductionFolderItem.piece_mark == mark,
+            ).first()
+            if existing:
+                continue
+
+            asm = db.query(Assembly).filter(
+                Assembly.project_id == folder.project_id,
+                Assembly.assembly_mark.ilike(f"%{mark}%")
+            ).first()
+
+            item = ProductionFolderItem(
+                folder_id=folder_id,
+                assembly_id=asm.id if asm else None,
+                piece_mark=mark,
+                status="pending",
+            )
+            db.add(item)
+            added += 1
+
+        db.commit()
+        return {"success": True, "added": added}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+@router.delete("/folders/{folder_id}/items/{item_id}")
+def remove_folder_item(folder_id: int, item_id: int):
+    db = get_db()
+    try:
+        item = db.query(ProductionFolderItem).get(item_id)
+        if not item or item.folder_id != folder_id:
+            raise HTTPException(404, "Item not found")
+        db.delete(item)
+        db.commit()
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+@router.post("/folders/{folder_id}/move-station")
+def move_folder_station(
+    folder_id: int,
+    station: str = Form(...),
+    sub_location: str = Form(""),
+    moved_by: str = Form(""),
+):
+    """Move entire folder to a new station. Updates all items + linked assemblies."""
+    db = get_db()
+    try:
+        folder = db.query(ProductionFolder).get(folder_id)
+        if not folder:
+            raise HTTPException(404, "Folder not found")
+
+        folder.station = station
+        folder.sub_location = sub_location
+        if folder.status == "open":
+            folder.status = "in_progress"
+
+        # Update all items in the folder
+        items = db.query(ProductionFolderItem).filter(
+            ProductionFolderItem.folder_id == folder_id,
+            ProductionFolderItem.status != "completed",
+        ).all()
+
+        for item in items:
+            item.station = station
+            # Update linked assembly in the project tracker
+            if item.assembly_id:
+                asm = db.query(Assembly).get(item.assembly_id)
+                if asm:
+                    asm.current_station = station
+                    # Record scan event for audit trail
+                    scan = ScanEvent(
+                        assembly_id=asm.id,
+                        station=station,
+                        scanned_by=moved_by or "Folder Move",
+                        notes=f"Folder {folder.folder_number} moved to {station}" + (f" ({sub_location})" if sub_location else ""),
+                    )
+                    db.add(scan)
+
+        db.commit()
+        return {"success": True, "items_updated": len(items)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+@router.post("/folders/{folder_id}/complete")
+def complete_folder(
+    folder_id: int,
+    completed_by: str = Form(""),
+    next_station: str = Form(""),
+):
+    """Mark folder as completed. All items get completed + assemblies updated."""
+    db = get_db()
+    try:
+        folder = db.query(ProductionFolder).get(folder_id)
+        if not folder:
+            raise HTTPException(404, "Folder not found")
+
+        now = datetime.utcnow()
+        folder.status = "completed"
+        folder.completed_date = now
+        folder.completed_by = completed_by
+
+        items = db.query(ProductionFolderItem).filter(
+            ProductionFolderItem.folder_id == folder_id
+        ).all()
+
+        station = next_station or folder.station
+        for item in items:
+            item.status = "completed"
+            item.completed_date = now
+            item.station = station
+            # Update assembly in project tracker
+            if item.assembly_id:
+                asm = db.query(Assembly).get(item.assembly_id)
+                if asm:
+                    asm.current_station = station
+                    scan = ScanEvent(
+                        assembly_id=asm.id,
+                        station=station,
+                        scanned_by=completed_by or "Folder Complete",
+                        notes=f"Folder {folder.folder_number} completed",
+                    )
+                    db.add(scan)
+
+        db.commit()
+        return {"success": True, "items_completed": len(items)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+@router.post("/folders/{folder_id}/complete-item/{item_id}")
+def complete_folder_item(
+    folder_id: int,
+    item_id: int,
+    completed_by: str = Form(""),
+    station: str = Form(""),
+):
+    """Mark a single item in a folder as completed."""
+    db = get_db()
+    try:
+        item = db.query(ProductionFolderItem).get(item_id)
+        if not item or item.folder_id != folder_id:
+            raise HTTPException(404, "Item not found")
+
+        item.status = "completed"
+        item.completed_date = datetime.utcnow()
+        if station:
+            item.station = station
+
+        # Update assembly
+        if item.assembly_id:
+            asm = db.query(Assembly).get(item.assembly_id)
+            if asm and station:
+                asm.current_station = station
+                scan = ScanEvent(
+                    assembly_id=asm.id,
+                    station=station,
+                    scanned_by=completed_by or "Item Complete",
+                    notes=f"Completed in Folder {db.query(ProductionFolder).get(folder_id).folder_number}",
+                )
+                db.add(scan)
+
+        # Check if all items in folder are now completed
+        folder = db.query(ProductionFolder).get(folder_id)
+        remaining = db.query(ProductionFolderItem).filter(
+            ProductionFolderItem.folder_id == folder_id,
+            ProductionFolderItem.status != "completed",
+        ).count()
+        if remaining == 0:
+            folder.status = "completed"
+            folder.completed_date = datetime.utcnow()
+            folder.completed_by = completed_by
+
+        db.commit()
+        return {"success": True, "folder_complete": remaining == 0}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+@router.delete("/folders/{folder_id}")
+def delete_folder(folder_id: int):
+    db = get_db()
+    try:
+        folder = db.query(ProductionFolder).get(folder_id)
+        if not folder:
+            raise HTTPException(404, "Folder not found")
+        db.delete(folder)
+        db.commit()
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+@router.post("/folders/{folder_id}/reorder")
+def reorder_folder(folder_id: int, priority: int = Form(...)):
+    db = get_db()
+    try:
+        folder = db.query(ProductionFolder).get(folder_id)
+        if not folder:
+            raise HTTPException(404, "Folder not found")
+        folder.priority = priority
+        db.commit()
+        return {"success": True}
     except Exception as e:
         db.rollback()
         raise HTTPException(500, str(e))
