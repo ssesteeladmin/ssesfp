@@ -53,6 +53,21 @@ SessionLocal = sessionmaker(bind=engine)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+
+    # Migrate: add new columns to existing tables
+    with engine.connect() as conn:
+        migrations = [
+            ("tracker_projects", "archived", "BOOLEAN DEFAULT FALSE"),
+            ("tracker_projects", "project_manager", "VARCHAR"),
+        ]
+        for table, col, col_type in migrations:
+            try:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}"))
+                conn.commit()
+                print(f"  ✅ Added {table}.{col}")
+            except Exception:
+                conn.rollback()  # column already exists, skip
+
     # Seed stock library
     db = SessionLocal()
     try:
