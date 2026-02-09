@@ -63,6 +63,12 @@ async def lifespan(app: FastAPI):
             ("tracker_parts", "is_main_member", "BOOLEAN DEFAULT FALSE"),
             ("tracker_parts", "width_inches", "FLOAT"),
             ("tracker_parts", "is_anchor_bolt", "BOOLEAN DEFAULT FALSE"),
+            ("tracker_material_inventory", "barcode", "VARCHAR(50) UNIQUE"),
+            ("tracker_material_inventory", "quantity", "INTEGER DEFAULT 1"),
+            ("tracker_material_inventory", "width_inches", "FLOAT"),
+            ("tracker_material_inventory", "reserved_project_id", "INTEGER"),
+            ("tracker_material_inventory", "reserved_date", "TIMESTAMP"),
+            ("tracker_material_inventory", "reserved_by", "VARCHAR(100)"),
         ]
         for table, col, col_type in migrations:
             try:

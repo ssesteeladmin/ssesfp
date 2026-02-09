@@ -331,18 +331,24 @@ class DropTag(Base):
 class MaterialInventory(Base):
     __tablename__ = "tracker_material_inventory"
     id = Column(Integer, primary_key=True)
-    source_type = Column(String(20))  # drop, surplus, purchased
+    barcode = Column(String(50), unique=True, nullable=True)
+    source_type = Column(String(20))  # drop, surplus, purchased, manual
     drop_tag_id = Column(Integer, ForeignKey("tracker_drop_tags.id"), nullable=True)
     member_size = Column(String(100))
     shape = Column(String(100))
     dimensions = Column(String(100))
     length_display = Column(String(50))
     length_inches = Column(Float)
+    width_inches = Column(Float, nullable=True)
+    quantity = Column(Integer, default=1)
     weight = Column(Numeric(10, 2))
     grade = Column(String(50))
     heat_number = Column(String(100))
     location = Column(String(100))
     status = Column(String(20), default="available")  # available, reserved, used, scrapped
+    reserved_project_id = Column(Integer, ForeignKey("tracker_projects.id"), nullable=True)
+    reserved_date = Column(DateTime, nullable=True)
+    reserved_by = Column(String(100), nullable=True)
     added_date = Column(DateTime, default=datetime.utcnow)
     added_by = Column(String(100))
     notes = Column(Text)

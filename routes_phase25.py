@@ -9,7 +9,7 @@ import uuid
 import math
 from datetime import datetime, date
 from typing import Optional, List
-from fastapi import APIRouter, HTTPException, Form, Query, UploadFile, File
+from fastapi import APIRouter, HTTPException, Form, Query, UploadFile, File, Body
 from pydantic import BaseModel
 from sqlalchemy import desc, func, or_
 from sqlalchemy.orm import Session
@@ -1863,26 +1863,503 @@ def scan_drop_tag_to_inventory(
 # ═══════════════════════════════════════════════════════════════
 
 @router.get("/inventory-v2")
-def list_material_inventory(shape: Optional[str] = None, status: str = "available"):
+def list_material_inventory(
+    shape: Optional[str] = None,
+    status: str = "available",
+    search: Optional[str] = None,
+    grade: Optional[str] = None,
+):
+    """List inventory with search/filter support."""
     db = get_db()
     try:
-        q = db.query(MaterialInventory).filter(MaterialInventory.status == status)
+        q = db.query(MaterialInventory)
+        if status and status != "all":
+            q = q.filter(MaterialInventory.status == status)
         if shape:
-            q = q.filter(MaterialInventory.shape == shape)
-        items = q.order_by(MaterialInventory.member_size, MaterialInventory.length_inches.desc()).all()
-        return [{
-            "id": i.id,
-            "source_type": i.source_type,
-            "member_size": i.member_size,
-            "length_display": i.length_display,
-            "length_inches": i.length_inches,
-            "weight": float(i.weight) if i.weight else 0,
-            "grade": i.grade,
-            "heat_number": i.heat_number,
-            "location": i.location,
-            "status": i.status,
-            "added_date": i.added_date.isoformat() if i.added_date else None,
-        } for i in items]
+            q = q.filter(MaterialInventory.shape.ilike(f"%{shape}%"))
+        if grade:
+            q = q.filter(MaterialInventory.grade.ilike(f"%{grade}%"))
+        if search:
+            term = f"%{search}%"
+            q = q.filter(
+                (MaterialInventory.member_size.ilike(term)) |
+                (MaterialInventory.shape.ilike(term)) |
+                (MaterialInventory.dimensions.ilike(term)) |
+                (MaterialInventory.location.ilike(term)) |
+                (MaterialInventory.heat_number.ilike(term)) |
+                (MaterialInventory.barcode.ilike(term)) |
+                (MaterialInventory.notes.ilike(term))
+            )
+        items = q.order_by(MaterialInventory.shape, MaterialInventory.member_size, MaterialInventory.length_inches.desc()).all()
+        return [_inv_to_dict(i, db) for i in items]
+    finally:
+        db.close()
+
+
+def _inv_to_dict(i, db=None):
+    proj_name = None
+    if i.reserved_project_id and db:
+        proj = db.query(Project).get(i.reserved_project_id)
+        if proj:
+            proj_name = f"{proj.job_number} - {proj.name}"
+    return {
+        "id": i.id,
+        "barcode": i.barcode,
+        "source_type": i.source_type,
+        "member_size": i.member_size,
+        "shape": i.shape,
+        "dimensions": i.dimensions,
+        "length_display": i.length_display,
+        "length_inches": float(i.length_inches) if i.length_inches else 0,
+        "width_inches": float(i.width_inches) if i.width_inches else None,
+        "quantity": i.quantity or 1,
+        "weight": float(i.weight) if i.weight else 0,
+        "grade": i.grade,
+        "heat_number": i.heat_number,
+        "location": i.location,
+        "status": i.status,
+        "reserved_project_id": i.reserved_project_id,
+        "reserved_project": proj_name,
+        "reserved_by": i.reserved_by,
+        "reserved_date": i.reserved_date.isoformat() if i.reserved_date else None,
+        "added_date": i.added_date.isoformat() if i.added_date else None,
+        "added_by": i.added_by,
+        "notes": i.notes,
+    }
+
+
+@router.get("/inventory-v2/summary")
+def inventory_summary():
+    """Get counts by shape for dashboard."""
+    db = get_db()
+    try:
+        items = db.query(MaterialInventory).filter(MaterialInventory.status == "available").all()
+        shapes = {}
+        for i in items:
+            s = i.shape or "Other"
+            if s not in shapes:
+                shapes[s] = {"count": 0, "total_qty": 0}
+            shapes[s]["count"] += 1
+            shapes[s]["total_qty"] += (i.quantity or 1)
+        return {"shapes": shapes, "total_items": len(items)}
+    finally:
+        db.close()
+
+
+class InventoryItemCreate(BaseModel):
+    shape: str
+    dimensions: str
+    grade: str = "A36"
+    length_display: str = ""
+    length_inches: float = 0
+    width_inches: Optional[float] = None
+    quantity: int = 1
+    weight: Optional[float] = None
+    heat_number: str = ""
+    location: str = ""
+    source_type: str = "manual"
+    notes: str = ""
+    added_by: str = ""
+
+
+@router.post("/inventory-v2")
+def add_inventory_item(data: InventoryItemCreate):
+    """Add a single inventory item and generate barcode."""
+    db = get_db()
+    try:
+        barcode = generate_barcode()
+        member_size = f"{data.shape} {data.dimensions}" if data.dimensions else data.shape
+        inv = MaterialInventory(
+            barcode=barcode,
+            source_type=data.source_type or "manual",
+            member_size=member_size,
+            shape=data.shape.upper(),
+            dimensions=data.dimensions,
+            length_display=data.length_display or (f"{round(data.length_inches / 12, 1)}'" if data.length_inches else ""),
+            length_inches=data.length_inches,
+            width_inches=data.width_inches,
+            quantity=data.quantity or 1,
+            weight=data.weight,
+            grade=data.grade or "A36",
+            heat_number=data.heat_number,
+            location=data.location,
+            status="available",
+            added_by=data.added_by,
+            notes=data.notes,
+        )
+        db.add(inv)
+        db.commit()
+        db.refresh(inv)
+        return _inv_to_dict(inv)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Error: {str(e)}")
+    finally:
+        db.close()
+
+
+@router.post("/inventory-v2/bulk-csv")
+async def bulk_add_inventory_csv(file: UploadFile = File(...), added_by: str = Form("")):
+    """Bulk import inventory from CSV. Columns: shape, dimensions, grade, length_display, length_inches, width_inches, quantity, heat_number, location, notes"""
+    import csv, io
+    db = get_db()
+    try:
+        content = (await file.read()).decode("utf-8-sig")
+        reader = csv.DictReader(io.StringIO(content))
+        added = 0
+        errors = []
+        for row_num, row in enumerate(reader, start=2):
+            try:
+                # Normalize column names (strip whitespace, lowercase)
+                row = {k.strip().lower().replace(" ", "_"): v.strip() for k, v in row.items() if k}
+                shape = row.get("shape", "").upper()
+                dims = row.get("dimensions", "")
+                if not shape:
+                    errors.append(f"Row {row_num}: missing shape")
+                    continue
+
+                length_in = 0
+                ld = row.get("length_display", "") or row.get("length", "")
+                li = row.get("length_inches", "")
+                if li:
+                    try:
+                        length_in = float(li)
+                    except ValueError:
+                        pass
+                elif ld:
+                    # Try parsing "20'" or "240" from display
+                    ld_clean = ld.replace("'", "").replace('"', "").strip()
+                    try:
+                        val = float(ld_clean)
+                        length_in = val * 12 if val < 100 else val  # assume feet if < 100
+                    except ValueError:
+                        pass
+
+                qty = 1
+                try:
+                    qty = int(row.get("quantity", "1") or "1")
+                except ValueError:
+                    pass
+
+                barcode = generate_barcode()
+                inv = MaterialInventory(
+                    barcode=barcode,
+                    source_type="manual",
+                    member_size=f"{shape} {dims}" if dims else shape,
+                    shape=shape,
+                    dimensions=dims,
+                    length_display=ld or (f"{round(length_in / 12, 1)}'" if length_in else ""),
+                    length_inches=length_in,
+                    width_inches=float(row.get("width_inches", "0") or "0") or None,
+                    quantity=qty,
+                    weight=float(row.get("weight", "0") or "0") or None,
+                    grade=row.get("grade", "A36") or "A36",
+                    heat_number=row.get("heat_number", ""),
+                    location=row.get("location", ""),
+                    status="available",
+                    added_by=added_by,
+                    notes=row.get("notes", ""),
+                )
+                db.add(inv)
+                added += 1
+            except Exception as e:
+                errors.append(f"Row {row_num}: {str(e)}")
+
+        db.commit()
+        return {"success": True, "added": added, "errors": errors}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"CSV import error: {str(e)}")
+    finally:
+        db.close()
+
+
+@router.put("/inventory-v2/{item_id}")
+def update_inventory_item(item_id: int, data: InventoryItemCreate):
+    """Update an inventory item."""
+    db = get_db()
+    try:
+        inv = db.query(MaterialInventory).get(item_id)
+        if not inv:
+            raise HTTPException(404, "Item not found")
+        inv.shape = data.shape.upper()
+        inv.dimensions = data.dimensions
+        inv.member_size = f"{data.shape} {data.dimensions}" if data.dimensions else data.shape
+        inv.grade = data.grade or "A36"
+        inv.length_display = data.length_display
+        inv.length_inches = data.length_inches
+        inv.width_inches = data.width_inches
+        inv.quantity = data.quantity or 1
+        inv.weight = data.weight
+        inv.heat_number = data.heat_number
+        inv.location = data.location
+        inv.notes = data.notes
+        if not inv.barcode:
+            inv.barcode = generate_barcode()
+        db.commit()
+        db.refresh(inv)
+        return _inv_to_dict(inv)
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+@router.delete("/inventory-v2/{item_id}")
+def delete_inventory_item(item_id: int):
+    db = get_db()
+    try:
+        inv = db.query(MaterialInventory).get(item_id)
+        if not inv:
+            raise HTTPException(404, "Item not found")
+        db.delete(inv)
+        db.commit()
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+@router.post("/inventory-v2/{item_id}/reserve")
+def reserve_inventory_item(
+    item_id: int,
+    project_id: int = Form(...),
+    reserved_by: str = Form(""),
+    qty_to_reserve: int = Form(0),
+):
+    """Reserve inventory for a project. If qty_to_reserve < total qty, splits the item."""
+    db = get_db()
+    try:
+        inv = db.query(MaterialInventory).get(item_id)
+        if not inv:
+            raise HTTPException(404, "Item not found")
+        if inv.status != "available":
+            raise HTTPException(400, f"Item is {inv.status}, not available")
+
+        total_qty = inv.quantity or 1
+        reserve_qty = qty_to_reserve if qty_to_reserve > 0 else total_qty
+
+        if reserve_qty > total_qty:
+            raise HTTPException(400, f"Only {total_qty} available")
+
+        if reserve_qty < total_qty:
+            # Split: reduce original qty, create new reserved item
+            inv.quantity = total_qty - reserve_qty
+            new_inv = MaterialInventory(
+                barcode=generate_barcode(),
+                source_type=inv.source_type,
+                member_size=inv.member_size,
+                shape=inv.shape,
+                dimensions=inv.dimensions,
+                length_display=inv.length_display,
+                length_inches=inv.length_inches,
+                width_inches=inv.width_inches,
+                quantity=reserve_qty,
+                weight=inv.weight,
+                grade=inv.grade,
+                heat_number=inv.heat_number,
+                location=inv.location,
+                status="reserved",
+                reserved_project_id=project_id,
+                reserved_date=datetime.utcnow(),
+                reserved_by=reserved_by,
+                added_date=inv.added_date,
+                added_by=inv.added_by,
+                notes=inv.notes,
+            )
+            db.add(new_inv)
+        else:
+            # Reserve the entire item
+            inv.status = "reserved"
+            inv.reserved_project_id = project_id
+            inv.reserved_date = datetime.utcnow()
+            inv.reserved_by = reserved_by
+
+        db.commit()
+        return {"success": True, "reserved_qty": reserve_qty}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+@router.post("/inventory-v2/{item_id}/release")
+def release_inventory_item(item_id: int):
+    """Release a reserved item back to available."""
+    db = get_db()
+    try:
+        inv = db.query(MaterialInventory).get(item_id)
+        if not inv:
+            raise HTTPException(404, "Item not found")
+        inv.status = "available"
+        inv.reserved_project_id = None
+        inv.reserved_date = None
+        inv.reserved_by = None
+        db.commit()
+        return {"success": True}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+@router.post("/projects/{project_id}/inventory-check")
+def check_inventory_before_rfq(project_id: int):
+    """
+    Compare the nesting buy list against available inventory.
+    Returns matches so PM can decide what to pull from stock vs buy.
+    """
+    db = get_db()
+    try:
+        # Get the latest nest run for this project
+        latest_run = db.query(NestRun).filter(NestRun.job_id == project_id).order_by(desc(NestRun.nest_date)).first()
+        if not latest_run:
+            return {"matches": [], "message": "No nest run found. Run nesting first."}
+
+        # Get nest items grouped by shape+dimensions+grade+stock_length
+        nest_items = db.query(NestRunItem).filter(NestRunItem.nest_run_id == latest_run.id).all()
+
+        # Build buy list from nest items (group by material)
+        buy_groups = {}
+        for ni in nest_items:
+            key = f"{(ni.shape or '').upper()}|{ni.dimensions or ''}|{ni.grade or ''}"
+            if key not in buy_groups:
+                buy_groups[key] = {"shape": ni.shape, "dimensions": ni.dimensions, "grade": ni.grade, "needed_qty": 0}
+            buy_groups[key]["needed_qty"] += 1
+
+        # Search inventory for matches
+        available = db.query(MaterialInventory).filter(
+            MaterialInventory.status == "available",
+            MaterialInventory.quantity > 0,
+        ).all()
+
+        matches = []
+        for key, need in buy_groups.items():
+            shape = (need["shape"] or "").upper()
+            dims = (need["dimensions"] or "").strip()
+            grade = (need["grade"] or "").strip()
+
+            matching_inv = []
+            for inv in available:
+                inv_shape = (inv.shape or "").upper()
+                inv_dims = (inv.dimensions or "").strip()
+                inv_grade = (inv.grade or "").strip()
+
+                # Match on shape + dimensions + grade
+                if inv_shape == shape and inv_dims == dims and inv_grade == grade:
+                    matching_inv.append({
+                        "inv_id": inv.id,
+                        "barcode": inv.barcode,
+                        "length_display": inv.length_display,
+                        "length_inches": float(inv.length_inches) if inv.length_inches else 0,
+                        "quantity": inv.quantity or 1,
+                        "location": inv.location,
+                        "heat_number": inv.heat_number,
+                    })
+
+                # Also match on member_size for broader catch
+                elif inv.member_size and inv.member_size.upper() == f"{shape} {dims}".upper():
+                    if not inv_grade or inv_grade.upper() == grade.upper():
+                        matching_inv.append({
+                            "inv_id": inv.id,
+                            "barcode": inv.barcode,
+                            "length_display": inv.length_display,
+                            "length_inches": float(inv.length_inches) if inv.length_inches else 0,
+                            "quantity": inv.quantity or 1,
+                            "location": inv.location,
+                            "heat_number": inv.heat_number,
+                        })
+
+            if matching_inv:
+                total_avail = sum(m["quantity"] for m in matching_inv)
+                matches.append({
+                    "material": f"{shape} {dims}",
+                    "grade": grade,
+                    "needed_qty": need["needed_qty"],
+                    "available_qty": total_avail,
+                    "can_cover": total_avail >= need["needed_qty"],
+                    "inventory_items": matching_inv,
+                })
+
+        return {
+            "nest_run_id": latest_run.id,
+            "matches": matches,
+            "total_buy_groups": len(buy_groups),
+            "groups_with_stock": len(matches),
+        }
+    finally:
+        db.close()
+
+
+@router.post("/projects/{project_id}/use-inventory")
+def use_inventory_for_project(project_id: int, data: dict = Body(...)):
+    """
+    PM selects which inventory items to use instead of buying.
+    data: { "items": [{"inv_id": 1, "qty": 5}, ...] }
+    After this, PM can create RFQ for remaining items only.
+    """
+    db = get_db()
+    try:
+        items = data.get("items", [])
+        used = 0
+        for item in items:
+            inv = db.query(MaterialInventory).get(item["inv_id"])
+            if not inv or inv.status != "available":
+                continue
+
+            use_qty = item.get("qty", inv.quantity or 1)
+            total = inv.quantity or 1
+
+            if use_qty >= total:
+                inv.status = "reserved"
+                inv.reserved_project_id = project_id
+                inv.reserved_date = datetime.utcnow()
+                inv.reserved_by = data.get("reserved_by", "")
+                used += total
+            else:
+                # Split
+                inv.quantity = total - use_qty
+                new_inv = MaterialInventory(
+                    barcode=generate_barcode(),
+                    source_type=inv.source_type,
+                    member_size=inv.member_size,
+                    shape=inv.shape,
+                    dimensions=inv.dimensions,
+                    length_display=inv.length_display,
+                    length_inches=inv.length_inches,
+                    width_inches=inv.width_inches,
+                    quantity=use_qty,
+                    weight=inv.weight,
+                    grade=inv.grade,
+                    heat_number=inv.heat_number,
+                    location=inv.location,
+                    status="reserved",
+                    reserved_project_id=project_id,
+                    reserved_date=datetime.utcnow(),
+                    reserved_by=data.get("reserved_by", ""),
+                    added_date=inv.added_date,
+                    added_by=inv.added_by,
+                    notes=inv.notes,
+                )
+                db.add(new_inv)
+                used += use_qty
+
+        db.commit()
+        return {"success": True, "items_reserved": used}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
     finally:
         db.close()
 
