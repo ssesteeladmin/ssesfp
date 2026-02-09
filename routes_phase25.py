@@ -729,6 +729,11 @@ def delete_nest_run(nest_run_id: int):
         if not nr:
             raise HTTPException(404, "Nest run not found")
 
+        # Nullify any RFQ references to this nest run
+        db.query(RFQv2).filter(RFQv2.nest_run_id == nest_run_id).update(
+            {RFQv2.nest_run_id: None}, synchronize_session=False
+        )
+
         # Delete drops (and any inventory created from them)
         drops = db.query(NestRunDrop).filter(NestRunDrop.nest_run_id == nest_run_id).all()
         for d in drops:
@@ -789,6 +794,9 @@ def unnest_parts(data: UnnestPartsRequest):
             if nr:
                 if remaining == 0:
                     # No items left — delete the whole run and its drops
+                    db.query(RFQv2).filter(RFQv2.nest_run_id == nr_id).update(
+                        {RFQv2.nest_run_id: None}, synchronize_session=False
+                    )
                     db.query(NestRunDrop).filter(NestRunDrop.nest_run_id == nr_id).delete()
                     db.delete(nr)
                 else:
