@@ -234,7 +234,9 @@ class Part(Base):
     length_inches = Column(Float)
     length_display = Column(String(50))  # e.g. 6'-10"
     weight = Column(Float)
+    width_inches = Column(Float)  # for plate parts: width dimension
     is_hardware = Column(Boolean, default=False)  # bolts, nuts, washers
+    is_anchor_bolt = Column(Boolean, default=False)  # AB designation - separate vendor
     remark = Column(String(255))  # Field, Shop, etc.
     pay_category = Column(String(100))
     cnc_file = Column(String(255))  # reference to NC1 file

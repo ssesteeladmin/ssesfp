@@ -61,6 +61,8 @@ async def lifespan(app: FastAPI):
             ("tracker_projects", "project_manager", "VARCHAR"),
             ("tracker_parts", "is_hardware", "BOOLEAN DEFAULT FALSE"),
             ("tracker_parts", "is_main_member", "BOOLEAN DEFAULT FALSE"),
+            ("tracker_parts", "width_inches", "FLOAT"),
+            ("tracker_parts", "is_anchor_bolt", "BOOLEAN DEFAULT FALSE"),
         ]
         for table, col, col_type in migrations:
             try:
@@ -615,7 +617,9 @@ async def create_project_from_xml(
                     grade=part_data['grade'],
                     length_inches=part_data.get('length_inches', 0),
                     length_display=part_data.get('length_display', ''),
-                    is_hardware=part_data['is_hardware'],
+                    width_inches=part_data.get('width_inches', 0),
+                    is_hardware=part_data.get('is_hardware', False),
+                    is_anchor_bolt=part_data.get('is_anchor_bolt', False),
                     remark=part_data.get('remark', ''),
                     pay_category=part_data.get('pay_category', ''),
                 )
@@ -762,7 +766,9 @@ async def import_xml(project_id: int, file: UploadFile = File(...)):
                     grade=part_data['grade'],
                     length_inches=part_data.get('length_inches', 0),
                     length_display=part_data.get('length_display', ''),
-                    is_hardware=part_data['is_hardware'],
+                    width_inches=part_data.get('width_inches', 0),
+                    is_hardware=part_data.get('is_hardware', False),
+                    is_anchor_bolt=part_data.get('is_anchor_bolt', False),
                     remark=part_data.get('remark', ''),
                     pay_category=part_data.get('pay_category', ''),
                 )

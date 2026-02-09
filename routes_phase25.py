@@ -205,8 +205,10 @@ def get_nestable_parts(project_id: int, shape: Optional[str] = None):
                 "grade": p.grade,
                 "length_inches": p.length_inches,
                 "length_display": p.length_display,
+                "width_inches": p.width_inches or 0,
                 "quantity": p.quantity * (asm.assembly_quantity if asm else 1),
                 "is_hardware": p.is_hardware,
+                "is_anchor_bolt": getattr(p, 'is_anchor_bolt', False),
                 "is_nested": already_nested is not None,
                 "is_locked": already_nested is not None,
             })
@@ -251,7 +253,7 @@ class NestRequest(BaseModel):
 
 @router.post("/projects/{project_id}/run-nest")
 def run_nest(project_id: int, data: NestRequest):
-    """Execute nesting on selected parts. Locks parts after nesting."""
+    """Execute nesting on selected parts with mixed-length optimization."""
     db = get_db()
     try:
         project = db.query(Project).get(project_id)
@@ -278,6 +280,7 @@ def run_nest(project_id: int, data: NestRequest):
                 "grade": part.grade,
                 "length_inches": part.length_inches or 0,
                 "length_display": part.length_display or "",
+                "width_inches": part.width_inches or 0,
                 "quantity": part.quantity * (asm.assembly_quantity if asm else 1),
             })
 
@@ -296,98 +299,231 @@ def run_nest(project_id: int, data: NestRequest):
         shape_map = {"W": "W", "WF": "W", "HSS": "HSS", "TS": "HSS", "HSSR": "HSSR", "RT": "RT",
                      "PIPE": "PIPE", "L": "L", "C": "C", "MC": "MC", "S": "S", "PL": "PL", "PLATE": "PL"}
 
-        # Run nesting algorithm per group
+        PLATE_SHAPES = ("PL", "PLATE")
         all_results = []
-        total_stock = 0
         total_used = 0
-        total_waste = 0
+        total_material = 0
+        buy_list = []  # consolidated purchase list
 
         for key, group in groups.items():
-            cut_lengths = []
-            part_refs = []
-            for item in group["items"]:
-                for _ in range(item["quantity"]):
-                    cut_lengths.append(item["length_inches"])
-                    part_refs.append(item)
+            is_plate = group["shape"].upper() in PLATE_SHAPES
 
-            if not cut_lengths:
-                continue
-
-            # Get stock config for this shape
+            # Get stock config
             mapped_shape = shape_map.get(group["shape"].upper(), group["shape"].upper())
             stock_cfg = db.query(StockConfig).filter(
                 StockConfig.shape_code == mapped_shape,
                 StockConfig.active == True
             ).first()
+            kerf = stock_cfg.kerf_inches if stock_cfg else 0.125
 
-            kerf = stock_cfg.kerf_inches if stock_cfg else 0.125  # 1/8" default
+            if is_plate and data.nest_mode != "mult":
+                # ═══ PLATE NESTING (2D strip packing) ═══
+                plates = []
+                part_refs = []
+                for item in group["items"]:
+                    for _ in range(item["quantity"]):
+                        w = item["width_inches"] or 12  # default 12" if no width
+                        l = item["length_inches"] or 12
+                        # Ensure w <= l (width is shorter side)
+                        if w > l:
+                            w, l = l, w
+                        plates.append({"width": w, "length": l})
+                        part_refs.append(item)
 
-            # Determine stock length(s) to try
-            if data.stock_length_inches > 0:
-                # User specified a length
-                stock_lengths_to_try = [data.stock_length_inches]
-            elif stock_cfg and stock_cfg.nest_type == "mult" and stock_cfg.available_lengths:
-                # Try all available lengths and pick best yield
-                stock_lengths_to_try = [l * 12 for l in stock_cfg.available_lengths]  # convert ft to inches
+                if not plates:
+                    continue
+
+                # Determine thickness for sheet size selection
+                thickness = _parse_plate_thickness(group["dimensions"])
+                available_sheets = _get_plate_sheets(stock_cfg, thickness)
+
+                # Try each sheet size, pick best utilization
+                best = None
+                for sheet in available_sheets:
+                    sw = sheet["w"] * 12  # feet to inches
+                    sl = sheet["l"] * 12
+
+                    # Strip packing: sort plates by width descending
+                    sorted_p = sorted(enumerate(plates), key=lambda x: -x[1]["width"])
+                    sheets_used = []
+                    cur = {"strips": [], "y_used": 0, "stock_w": sw, "stock_l": sl}
+
+                    for orig_idx, pl in sorted_p:
+                        pw, pl_len = pl["width"], pl["length"]
+                        placed = False
+
+                        # Try existing strips on current sheet
+                        for strip in cur["strips"]:
+                            if strip["x_rem"] >= pl_len + kerf and strip["h"] >= pw:
+                                strip["cuts"].append((orig_idx, pw, pl_len))
+                                strip["x_rem"] -= (pl_len + kerf)
+                                placed = True
+                                break
+
+                        if not placed and cur["y_used"] + pw + kerf <= sw:
+                            # New strip on current sheet
+                            cur["strips"].append({
+                                "h": pw, "x_rem": sl - pl_len - kerf,
+                                "cuts": [(orig_idx, pw, pl_len)]
+                            })
+                            cur["y_used"] += pw + kerf
+                            placed = True
+
+                        if not placed:
+                            # New sheet
+                            sheets_used.append(cur)
+                            cur = {
+                                "strips": [{"h": pw, "x_rem": sl - pl_len - kerf, "cuts": [(orig_idx, pw, pl_len)]}],
+                                "y_used": pw + kerf, "stock_w": sw, "stock_l": sl
+                            }
+
+                    sheets_used.append(cur)
+
+                    total_sheet_area = len(sheets_used) * sw * sl
+                    total_piece_area = sum(p["width"] * p["length"] for p in plates)
+                    util = (total_piece_area / total_sheet_area * 100) if total_sheet_area > 0 else 0
+
+                    if best is None or util > best["util"]:
+                        best = {"sheet": sheet, "sheets_used": sheets_used, "util": util}
+
+                if not best:
+                    continue
+
+                sheet = best["sheet"]
+                sw_in = sheet["w"] * 12
+                sl_in = sheet["l"] * 12
+                n_sheets = len(best["sheets_used"])
+
+                total_piece_area = sum(p["width"] * p["length"] for p in plates)
+                total_sheet_area = n_sheets * sw_in * sl_in
+                total_material += total_sheet_area
+                total_used += total_piece_area
+
+                buy_list.append({
+                    "shape": group["shape"],
+                    "dimensions": group["dimensions"],
+                    "grade": group["grade"],
+                    "stock_desc": f"{sheet['w']}'×{sheet['l']}' PL {group['dimensions']}",
+                    "qty": n_sheets,
+                    "stock_length_ft": sheet["l"],
+                    "stock_width_ft": sheet["w"],
+                    "is_plate": True,
+                })
+
+                # Store as nest result bins (one bin per sheet)
+                bins_for_result = []
+                for sh in best["sheets_used"]:
+                    all_cuts = []
+                    for strip in sh["strips"]:
+                        for c in strip["cuts"]:
+                            all_cuts.append(c)
+                    bins_for_result.append({
+                        "stock_length": sl_in,
+                        "stock_width": sw_in,
+                        "remaining": (sw_in * sl_in) - sum(c[1] * c[2] for c in all_cuts),
+                        "cuts": [(c[0], c[2]) for c in all_cuts],  # (orig_idx, length)
+                    })
+
+                all_results.append({
+                    "shape": group["shape"],
+                    "dimensions": group["dimensions"],
+                    "grade": group["grade"],
+                    "is_plate": True,
+                    "bins": bins_for_result,
+                    "part_refs": part_refs,
+                    "cut_lengths": [p["length"] for p in plates],
+                    "sheet_desc": f"{sheet['w']}'×{sheet['l']}'",
+                    "yield_pct": round(best["util"], 1),
+                })
+
             else:
-                stock_lengths_to_try = [480]  # 40ft default
+                # ═══ MULT NESTING (mixed-length 1D bin packing) ═══
+                cut_lengths = []
+                part_refs = []
+                for item in group["items"]:
+                    for _ in range(item["quantity"]):
+                        cut_lengths.append(item["length_inches"])
+                        part_refs.append(item)
 
-            # Find the longest part to filter out stock lengths that are too short
-            max_cut = max(cut_lengths) if cut_lengths else 0
-            valid_lengths = [sl for sl in stock_lengths_to_try if sl >= max_cut + kerf]
-            if not valid_lengths:
-                valid_lengths = [max(stock_lengths_to_try)]  # fallback to longest
+                if not cut_lengths:
+                    continue
 
-            # Try each valid stock length, pick best yield
-            best_result = None
-            best_yield = -1
+                # Get available stock lengths in inches
+                if data.stock_length_inches > 0:
+                    avail_inches = [data.stock_length_inches]
+                elif stock_cfg and stock_cfg.available_lengths:
+                    avail_inches = sorted([l * 12 for l in stock_cfg.available_lengths])
+                else:
+                    avail_inches = [480]  # 40ft default
 
-            for stock_len in valid_lengths:
+                # Mixed-length best-fit-decreasing bin packing
                 indexed = sorted(enumerate(cut_lengths), key=lambda x: -x[1])
                 bins = []
 
                 for orig_idx, length in indexed:
-                    placed = False
+                    # Best-fit: find bin with least remaining that still fits
+                    best_bin = None
+                    best_remaining = float('inf')
                     for b in bins:
                         if b["remaining"] >= length + kerf:
-                            b["cuts"].append((orig_idx, length))
-                            b["remaining"] -= (length + kerf)
-                            placed = True
-                            break
-                    if not placed:
-                        bins.append({"remaining": stock_len - length - kerf, "cuts": [(orig_idx, length)]})
+                            nr = b["remaining"] - length - kerf
+                            if nr < best_remaining:
+                                best_remaining = nr
+                                best_bin = b
 
-                total_material = len(bins) * stock_len
-                used_material = sum(stock_len - b["remaining"] for b in bins)
-                trial_yield = (used_material / total_material * 100) if total_material > 0 else 0
+                    if best_bin:
+                        best_bin["cuts"].append((orig_idx, length))
+                        best_bin["remaining"] -= (length + kerf)
+                    else:
+                        # Open new bin - pick SMALLEST stock that fits
+                        valid = [sl for sl in avail_inches if sl >= length + kerf]
+                        if not valid:
+                            stock_len = max(avail_inches)
+                        else:
+                            stock_len = valid[0]
+                        bins.append({
+                            "stock_length": stock_len,
+                            "remaining": stock_len - length - kerf,
+                            "cuts": [(orig_idx, length)]
+                        })
 
-                if trial_yield > best_yield:
-                    best_yield = trial_yield
-                    best_result = {"stock_len": stock_len, "bins": bins}
+                # Calculate totals for this group
+                group_material = sum(b["stock_length"] for b in bins)
+                group_used = sum(b["stock_length"] - b["remaining"] for b in bins)
+                total_material += group_material
+                total_used += group_used
 
-            stock_len = best_result["stock_len"]
-            bins = best_result["bins"]
+                # Build buy list - consolidate by stock length
+                length_counts = {}
+                for b in bins:
+                    sl_ft = round(b["stock_length"] / 12, 1)
+                    length_counts[sl_ft] = length_counts.get(sl_ft, 0) + 1
 
-            total_stock += len(bins)
-            for b in bins:
-                used = stock_len - b["remaining"]
-                total_used += used
-                total_waste += b["remaining"]
+                for sl_ft, qty in sorted(length_counts.items()):
+                    buy_list.append({
+                        "shape": group["shape"],
+                        "dimensions": group["dimensions"],
+                        "grade": group["grade"],
+                        "stock_desc": f"{group['shape']} {group['dimensions']} × {sl_ft}'",
+                        "qty": qty,
+                        "stock_length_ft": sl_ft,
+                        "is_plate": False,
+                    })
 
-            all_results.append({
-                "shape": group["shape"],
-                "dimensions": group["dimensions"],
-                "grade": group["grade"],
-                "stock_length": stock_len,
-                "bins": bins,
-                "part_refs": part_refs,
-                "cut_lengths": cut_lengths,
-            })
+                all_results.append({
+                    "shape": group["shape"],
+                    "dimensions": group["dimensions"],
+                    "grade": group["grade"],
+                    "is_plate": False,
+                    "bins": bins,
+                    "part_refs": part_refs,
+                    "cut_lengths": cut_lengths,
+                })
 
-        total_material = sum(len(r["bins"]) * r["stock_length"] for r in all_results)
         yield_pct = round((total_used / total_material * 100), 1) if total_material > 0 else 0
 
         # Create nest run record
+        total_stock = sum(len(r["bins"]) for r in all_results)
         nest_run = NestRun(
             job_id=project_id,
             operator=data.operator,
@@ -405,6 +541,7 @@ def run_nest(project_id: int, data: NestRequest):
         nest_drops = []
         for res in all_results:
             for bin_idx, b in enumerate(res["bins"]):
+                stock_len = b.get("stock_length", 0)
                 for cut_idx, (orig_idx, length) in enumerate(b["cuts"]):
                     p_ref = res["part_refs"][orig_idx]
                     item = NestRunItem(
@@ -432,7 +569,7 @@ def run_nest(project_id: int, data: NestRequest):
 
                 # Drop for this stock piece
                 drop_inches = b["remaining"]
-                if drop_inches > 6:  # only track drops > 6 inches
+                if drop_inches > 6:
                     ft = int(drop_inches // 12)
                     inches = round(drop_inches % 12, 1)
                     drop_display = f"{ft}'-{inches}\"" if ft > 0 else f'{inches}"'
@@ -442,7 +579,7 @@ def run_nest(project_id: int, data: NestRequest):
                         shape=res["shape"],
                         dimensions=res["dimensions"],
                         grade=res["grade"],
-                        stock_length_inches=res["stock_length"],
+                        stock_length_inches=stock_len,
                         drop_length_inches=drop_inches,
                         drop_length_display=drop_display,
                     )
@@ -451,6 +588,7 @@ def run_nest(project_id: int, data: NestRequest):
                         "stock_index": bin_idx,
                         "shape": f"{res['shape']} {res['dimensions']}",
                         "grade": res["grade"],
+                        "stock_length_ft": round(stock_len / 12, 1),
                         "drop_length": drop_display,
                         "drop_inches": round(drop_inches, 1),
                     })
@@ -464,12 +602,17 @@ def run_nest(project_id: int, data: NestRequest):
             "total_parts_nested": len(data.part_ids),
             "items": nest_items,
             "drops": nest_drops,
+            "buy_list": buy_list,
             "groups": [{
                 "shape": r["shape"],
                 "dimensions": r["dimensions"],
                 "grade": r["grade"],
+                "is_plate": r.get("is_plate", False),
                 "stock_count": len(r["bins"]),
-                "stock_length_ft": round(r["stock_length"] / 12, 1),
+                "yield_pct": r.get("yield_pct"),
+                "sheet_desc": r.get("sheet_desc"),
+                # For mult: show mixed lengths used
+                "stock_lengths": list(set(round(b["stock_length"] / 12, 1) for b in r["bins"])) if not r.get("is_plate") else [],
             } for r in all_results],
         }
     except HTTPException:
@@ -479,6 +622,43 @@ def run_nest(project_id: int, data: NestRequest):
         raise HTTPException(500, f"Nesting error: {str(e)}")
     finally:
         db.close()
+
+
+def _parse_plate_thickness(dimensions_str):
+    """Parse plate thickness from dimensions string like '1/2', '3/4', '1-1/4'."""
+    s = (dimensions_str or "").strip()
+    try:
+        if "-" in s and "/" in s:
+            # Mixed: "1-1/4" -> 1.25
+            parts = s.split("-")
+            whole = float(parts[0])
+            num, den = parts[1].split("/")
+            return whole + float(num) / float(den)
+        elif "/" in s:
+            num, den = s.split("/")
+            return float(num) / float(den)
+        else:
+            return float(s) if s else 0.5
+    except (ValueError, ZeroDivisionError):
+        return 0.5  # default
+
+
+def _get_plate_sheets(stock_cfg, thickness):
+    """Get available plate sheet sizes for a given thickness."""
+    if not stock_cfg or not stock_cfg.available_lengths:
+        # Default sheets
+        return [{"w": 4, "l": 8}, {"w": 5, "l": 10}]
+
+    sheets = []
+    for s in stock_cfg.available_lengths:
+        if not isinstance(s, dict):
+            continue
+        t_min = s.get("thickness_min", 0)
+        t_max = s.get("thickness_max", 99)
+        if t_min <= thickness <= t_max:
+            sheets.append({"w": s["w"], "l": s["l"]})
+
+    return sheets if sheets else [{"w": 4, "l": 8}, {"w": 5, "l": 10}]
 
 
 @router.get("/nest-runs/{nest_run_id}")
@@ -600,14 +780,13 @@ class RFQCreateFromNest(BaseModel):
 
 @router.post("/projects/{project_id}/rfqs")
 def create_rfq(project_id: int, data: RFQCreateFromNest):
-    """Create an RFQ from nest run results."""
+    """Create an RFQ from nest run results with actual stock lengths."""
     db = get_db()
     try:
         project = db.query(Project).get(project_id)
         if not project:
             raise HTTPException(404)
 
-        # Generate RFQ number
         count = db.query(RFQv2).filter(RFQv2.job_id == project_id).count()
         rfq_number = f"{project.job_number}-RFQ{count + 1:02d}"
 
@@ -621,34 +800,42 @@ def create_rfq(project_id: int, data: RFQCreateFromNest):
         db.add(rfq)
         db.flush()
 
-        # Get nest items
+        # Get nest items and drops to determine stock lengths per bin
         q = db.query(NestRunItem).filter(NestRunItem.nest_run_id == data.nest_run_id)
         if data.item_ids:
             q = q.filter(NestRunItem.id.in_(data.item_ids))
         nest_items = q.all()
 
-        # Consolidate by shape/dimensions/grade - sum up stock pieces needed
+        # Get drops to find stock lengths per stock_index
+        drops = db.query(NestRunDrop).filter(NestRunDrop.nest_run_id == data.nest_run_id).all()
+        stock_lengths = {}  # (shape, dims, grade, stock_index) -> stock_length_inches
+        for d in drops:
+            stock_lengths[(d.shape, d.dimensions, d.grade, d.stock_index)] = d.stock_length_inches
+
+        # Consolidate by shape+dimensions+grade+stock_length
         material = {}
         for ni in nest_items:
-            key = f"{ni.shape}|{ni.dimensions}|{ni.grade}"
+            sl = stock_lengths.get((ni.shape, ni.dimensions, ni.grade, ni.stock_index), 480)
+            sl_ft = round(sl / 12, 1)
+            key = f"{ni.shape}|{ni.dimensions}|{ni.grade}|{sl_ft}"
             if key not in material:
                 material[key] = {
                     "shape": ni.shape, "dimensions": ni.dimensions, "grade": ni.grade,
-                    "stock_indices": set(), "total_qty": 0,
+                    "stock_length_ft": sl_ft,
+                    "stock_indices": set(),
                 }
             material[key]["stock_indices"].add(ni.stock_index)
-            material[key]["total_qty"] += 1
-
-        # Get stock length from nest run drops
-        nest_run = db.query(NestRun).get(data.nest_run_id)
-        stock_length_display = "40'-0\""
 
         line_num = 0
         items_created = []
         for key, mat in material.items():
             line_num += 1
-            is_hw = mat["shape"] in ("HS", "NU", "WA", "MB", "ROD")  # hardware shapes
-            qty = len(mat["stock_indices"])  # number of stock pieces
+            is_hw = mat["shape"] in ("HS", "NU", "WA", "MB", "ROD", "AB")
+            qty = len(mat["stock_indices"])
+            sl_ft = mat["stock_length_ft"]
+            ft = int(sl_ft)
+            inch_rem = round((sl_ft - ft) * 12)
+            length_disp = f"{ft}'-{inch_rem}\"" if inch_rem else f"{ft}'-0\""
 
             item = RFQItemv2(
                 rfq_id=rfq.id,
@@ -657,28 +844,197 @@ def create_rfq(project_id: int, data: RFQCreateFromNest):
                 shape=mat["shape"],
                 dimensions=mat["dimensions"],
                 grade=mat["grade"],
-                length_display=stock_length_display,
+                length_display=length_disp,
+                length_inches=sl_ft * 12,
                 job_number=project.job_number,
                 is_hardware=is_hw,
                 excluded=is_hw and data.exclude_hardware,
             )
             db.add(item)
             items_created.append({
-                "line": line_num,
-                "qty": qty,
-                "shape": mat["shape"],
-                "dimensions": mat["dimensions"],
-                "grade": mat["grade"],
-                "is_hardware": is_hw,
+                "line": line_num, "qty": qty, "shape": mat["shape"],
+                "dimensions": mat["dimensions"], "grade": mat["grade"],
+                "length": length_disp, "is_hardware": is_hw,
                 "excluded": is_hw and data.exclude_hardware,
             })
 
         db.commit()
-        return {
-            "rfq_id": rfq.id,
-            "rfq_number": rfq_number,
-            "items": items_created,
-        }
+        return {"rfq_id": rfq.id, "rfq_number": rfq_number, "items": items_created}
+    finally:
+        db.close()
+
+
+@router.delete("/rfqs/{rfq_id}")
+def delete_rfq(rfq_id: int):
+    """Delete an RFQ and all associated quotes/items."""
+    db = get_db()
+    try:
+        rfq = db.query(RFQv2).get(rfq_id)
+        if not rfq:
+            raise HTTPException(404)
+        # Delete quote items, quotes, rfq items
+        for q in db.query(RFQQuote).filter(RFQQuote.rfq_id == rfq_id).all():
+            db.query(RFQQuoteItem).filter(RFQQuoteItem.quote_id == q.id).delete()
+            db.delete(q)
+        db.query(RFQItemv2).filter(RFQItemv2.rfq_id == rfq_id).delete()
+        db.delete(rfq)
+        db.commit()
+        return {"success": True}
+    finally:
+        db.close()
+
+
+@router.delete("/pos/{po_id}")
+def delete_po(po_id: int):
+    """Delete a PO and all line items."""
+    db = get_db()
+    try:
+        po = db.query(POv2).get(po_id)
+        if not po:
+            raise HTTPException(404)
+        db.query(POItemv2).filter(POItemv2.po_id == po_id).delete()
+        db.delete(po)
+        db.commit()
+        return {"success": True}
+    finally:
+        db.close()
+
+
+class ManualPOCreate(BaseModel):
+    vendor_id: Optional[int] = None
+    ordered_by: str = ""
+    terms: str = "Net 45 days"
+    fob: str = ""
+    ship_via: str = ""
+    notes: str = ""
+    items: List[dict] = []  # [{qty, shape, dimensions, grade, length_display, unit_cost, unit_type}]
+
+
+@router.post("/projects/{project_id}/manual-po")
+def create_manual_po(project_id: int, data: ManualPOCreate):
+    """Create a PO manually (self-write) without going through RFQ."""
+    db = get_db()
+    try:
+        project = db.query(Project).get(project_id)
+        if not project:
+            raise HTTPException(404)
+
+        count = db.query(POv2).filter(POv2.job_id == project_id).count()
+        po_number = f"{project.job_number}-PO{count + 1:02d}"
+        vendor = db.query(Vendor).get(data.vendor_id) if data.vendor_id else None
+
+        po = POv2(
+            job_id=project_id,
+            po_number=po_number,
+            vendor_id=data.vendor_id,
+            ordered_by=data.ordered_by,
+            order_date=date.today(),
+            terms=data.terms or (vendor.default_terms if vendor else "Net 45 days"),
+            fob=data.fob,
+            ship_via=data.ship_via,
+            notes=data.notes,
+            status="draft",
+        )
+        db.add(po)
+        db.flush()
+
+        line = 0
+        for item_data in data.items:
+            line += 1
+            barcode = generate_barcode()
+            poi = POItemv2(
+                po_id=po.id,
+                line_number=line,
+                qty=item_data.get("qty", 1),
+                shape=item_data.get("shape", ""),
+                dimensions=item_data.get("dimensions", ""),
+                grade=item_data.get("grade", ""),
+                length_display=item_data.get("length_display", ""),
+                job_number=project.job_number,
+                unit_cost=item_data.get("unit_cost"),
+                unit_type=item_data.get("unit_type", "ea"),
+                receiving_barcode=barcode,
+            )
+            db.add(poi)
+
+        db.commit()
+        return {"po_id": po.id, "po_number": po_number, "items": line}
+    finally:
+        db.close()
+
+
+class HardwareRFQCreate(BaseModel):
+    vendor_id: Optional[int] = None
+    hw_type: str = "hardware"  # "hardware", "anchor_bolts", or "all"
+
+
+@router.post("/projects/{project_id}/hardware-rfq")
+def create_hardware_rfq(project_id: int, data: HardwareRFQCreate):
+    """Create an RFQ from hardware items. Separates anchor bolts from other hardware."""
+    db = get_db()
+    try:
+        project = db.query(Project).get(project_id)
+        if not project:
+            raise HTTPException(404)
+
+        # Get hardware parts
+        hw_q = db.query(Part).join(Assembly).filter(
+            Assembly.project_id == project_id,
+            Part.is_hardware == True,
+        )
+
+        if data.hw_type == "anchor_bolts":
+            hw_q = hw_q.filter(or_(Part.is_anchor_bolt == True, Part.shape == "AB"))
+        elif data.hw_type == "hardware":
+            hw_q = hw_q.filter(or_(Part.is_anchor_bolt == False, Part.is_anchor_bolt.is_(None)))
+            hw_q = hw_q.filter(Part.shape != "AB")
+
+        hw_parts = hw_q.all()
+        if not hw_parts:
+            raise HTTPException(400, f"No {data.hw_type} items found")
+
+        # Group by shape+dimensions+grade
+        groups = {}
+        for p in hw_parts:
+            asm = db.query(Assembly).get(p.assembly_id)
+            qty = p.quantity * (asm.assembly_quantity if asm else 1)
+            key = f"{p.shape}|{p.dimensions}|{p.grade}"
+            if key not in groups:
+                groups[key] = {"shape": p.shape, "dimensions": p.dimensions, "grade": p.grade or "", "total_qty": 0}
+            groups[key]["total_qty"] += qty
+
+        count = db.query(RFQv2).filter(RFQv2.job_id == project_id).count()
+        suffix = "AB" if data.hw_type == "anchor_bolts" else "HW"
+        rfq_number = f"{project.job_number}-RFQ{count + 1:02d}-{suffix}"
+
+        rfq = RFQv2(
+            job_id=project_id,
+            rfq_number=rfq_number,
+            vendor_id=data.vendor_id,
+            status="draft",
+        )
+        db.add(rfq)
+        db.flush()
+
+        line = 0
+        items_created = []
+        for key, g in groups.items():
+            line += 1
+            item = RFQItemv2(
+                rfq_id=rfq.id,
+                line_number=line,
+                qty=g["total_qty"],
+                shape=g["shape"],
+                dimensions=g["dimensions"],
+                grade=g["grade"],
+                job_number=project.job_number,
+                is_hardware=True,
+            )
+            db.add(item)
+            items_created.append({"line": line, "qty": g["total_qty"], "shape": g["shape"], "dimensions": g["dimensions"]})
+
+        db.commit()
+        return {"rfq_id": rfq.id, "rfq_number": rfq_number, "items": items_created, "hw_type": data.hw_type}
     finally:
         db.close()
 
@@ -1039,7 +1395,7 @@ def convert_rfq_to_po(rfq_id: int, ordered_by: str = Form("")):
 
 @router.get("/projects/{project_id}/hardware-summary")
 def get_hardware_summary(project_id: int):
-    """Get a summary of all hardware items in a project, grouped by type/size."""
+    """Get a summary of all hardware items, split by anchor bolts vs other hardware."""
     db = get_db()
     try:
         hw_parts = db.query(Part).join(Assembly).filter(
@@ -1051,11 +1407,13 @@ def get_hardware_summary(project_id: int):
         for p in hw_parts:
             asm = db.query(Assembly).get(p.assembly_id)
             qty = p.quantity * (asm.assembly_quantity if asm else 1)
-            key = f"{p.shape}|{p.dimensions}|{p.grade}"
+            is_ab = getattr(p, 'is_anchor_bolt', False) or p.shape == 'AB'
+            key = f"{p.shape}|{p.dimensions}|{p.grade}|{'AB' if is_ab else 'HW'}"
             if key not in groups:
                 groups[key] = {
                     "shape": p.shape, "dimensions": p.dimensions, "grade": p.grade or "",
-                    "length_display": p.length_display or "", "total_qty": 0, "parts": [],
+                    "length_display": p.length_display or "", "total_qty": 0,
+                    "is_anchor_bolt": is_ab, "parts": [],
                 }
             groups[key]["total_qty"] += qty
             groups[key]["parts"].append({
@@ -1064,80 +1422,6 @@ def get_hardware_summary(project_id: int):
                 "qty": qty,
             })
         return list(groups.values())
-    finally:
-        db.close()
-
-
-@router.post("/projects/{project_id}/create-hardware-po")
-def create_hardware_po(
-    project_id: int,
-    vendor_id: int = Form(0),
-    ordered_by: str = Form(""),
-):
-    """Create a PO directly from hardware items (bypass nesting/RFQ)."""
-    db = get_db()
-    try:
-        project = db.query(Project).get(project_id)
-        if not project:
-            raise HTTPException(404)
-
-        hw_parts = db.query(Part).join(Assembly).filter(
-            Assembly.project_id == project_id,
-            Part.is_hardware == True,
-        ).all()
-
-        if not hw_parts:
-            raise HTTPException(400, "No hardware items in this project")
-
-        # Group by shape+dimensions+grade
-        groups = {}
-        for p in hw_parts:
-            asm = db.query(Assembly).get(p.assembly_id)
-            qty = p.quantity * (asm.assembly_quantity if asm else 1)
-            key = f"{p.shape}|{p.dimensions}|{p.grade}"
-            if key not in groups:
-                groups[key] = {
-                    "shape": p.shape, "dimensions": p.dimensions, "grade": p.grade or "",
-                    "length_display": p.length_display or "", "total_qty": 0,
-                }
-            groups[key]["total_qty"] += qty
-
-        count = db.query(POv2).filter(POv2.job_id == project_id).count()
-        po_number = f"{project.job_number}-PO{count + 1:02d}"
-
-        vendor = db.query(Vendor).get(vendor_id) if vendor_id and vendor_id > 0 else None
-
-        po = POv2(
-            job_id=project_id,
-            po_number=po_number,
-            vendor_id=vendor_id if vendor_id and vendor_id > 0 else None,
-            ordered_by=ordered_by,
-            order_date=date.today(),
-            terms=vendor.default_terms if vendor else "Net 45 days",
-            status="draft",
-        )
-        db.add(po)
-        db.flush()
-
-        line = 0
-        for key, g in groups.items():
-            line += 1
-            barcode = generate_barcode()
-            poi = POItemv2(
-                po_id=po.id,
-                line_number=line,
-                qty=g["total_qty"],
-                shape=g["shape"],
-                dimensions=g["dimensions"],
-                grade=g["grade"],
-                length_display=g["length_display"],
-                job_number=project.job_number,
-                receiving_barcode=barcode,
-            )
-            db.add(poi)
-
-        db.commit()
-        return {"po_id": po.id, "po_number": po_number, "items": line}
     finally:
         db.close()
 

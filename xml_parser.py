@@ -98,18 +98,37 @@ def parse_tekla_xml(xml_content: str) -> Dict[str, Any]:
                     'dimensions': _text(part, 'fs:Dimensions', ns),
                     'grade': _text(part, 'fs:Grade', ns),
                     'length_raw': _text(part, 'fs:Length', ns),
+                    'width_raw': _text(part, 'fs:Width', ns),
                     'remark': _text(part, 'fs:Remark', ns),
                     'pay_category': _text(part, 'fs:PayCategory', ns),
                 }
                 
-                # Determine if hardware
-                part_data['is_hardware'] = part_data['shape'] in ('HS', 'NU', 'WA')
+                # Determine if hardware (bolts, nuts, washers, anchor bolts)
+                hw_shapes = ('HS', 'NU', 'WA', 'AB', 'MB')
+                part_data['is_hardware'] = part_data['shape'] in hw_shapes
+                
+                # Detect anchor bolts from shape or part mark
+                shape_up = part_data['shape'].upper()
+                mark_up = (part_data['part_mark'] or '').upper()
+                dims_up = (part_data['dimensions'] or '').upper()
+                part_data['is_anchor_bolt'] = (
+                    shape_up == 'AB' or
+                    'ANCHOR' in dims_up or
+                    mark_up.startswith('AB') or
+                    (shape_up == 'ROD' and 'ANCHOR' in (part_data.get('remark') or '').upper())
+                )
                 
                 # Parse length to float
                 try:
                     part_data['length_inches'] = float(part_data['length_raw']) if part_data['length_raw'] else 0
                 except (ValueError, TypeError):
                     part_data['length_inches'] = 0
+                
+                # Parse width for plate parts
+                try:
+                    part_data['width_inches'] = float(part_data['width_raw']) if part_data.get('width_raw') else 0
+                except (ValueError, TypeError):
+                    part_data['width_inches'] = 0
                 
                 # Convert to display format (ft-in)
                 part_data['length_display'] = inches_to_ft_in(part_data['length_inches'])
