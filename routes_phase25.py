@@ -707,6 +707,11 @@ def _parse_mixed_fraction(s):
         return 0
 
 
+def _generate_inv_barcode():
+    """Generate inventory-specific barcode with INV- prefix."""
+    return f"INV-{uuid.uuid4().hex[:8].upper()}"
+
+
 def _get_plate_sheets(stock_cfg, thickness):
     """Get available plate sheet sizes for a given thickness."""
     if not stock_cfg or not stock_cfg.available_lengths:
@@ -1967,7 +1972,7 @@ def add_inventory_item(data: InventoryItemCreate):
     """Add a single inventory item and generate barcode."""
     db = get_db()
     try:
-        barcode = generate_barcode()
+        barcode = _generate_inv_barcode()
         member_size = f"{data.shape} {data.dimensions}" if data.dimensions else data.shape
         inv = MaterialInventory(
             barcode=barcode,
@@ -2041,7 +2046,7 @@ async def bulk_add_inventory_csv(file: UploadFile = File(...), added_by: str = F
                 except ValueError:
                     pass
 
-                barcode = generate_barcode()
+                barcode = _generate_inv_barcode()
                 inv = MaterialInventory(
                     barcode=barcode,
                     source_type="manual",
@@ -2095,7 +2100,7 @@ def update_inventory_item(item_id: int, data: InventoryItemCreate):
         inv.location = data.location
         inv.notes = data.notes
         if not inv.barcode:
-            inv.barcode = generate_barcode()
+            inv.barcode = _generate_inv_barcode()
         db.commit()
         db.refresh(inv)
         return _inv_to_dict(inv)
@@ -2153,7 +2158,7 @@ def reserve_inventory_item(
             # Split: reduce original qty, create new reserved item
             inv.quantity = total_qty - reserve_qty
             new_inv = MaterialInventory(
-                barcode=generate_barcode(),
+                barcode=_generate_inv_barcode(),
                 source_type=inv.source_type,
                 member_size=inv.member_size,
                 shape=inv.shape,
@@ -2210,6 +2215,37 @@ def release_inventory_item(item_id: int):
     except Exception as e:
         db.rollback()
         raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+@router.post("/inventory-v2/{item_id}/update-location")
+def update_inventory_location(item_id: int, location: str = Form(...)):
+    """Update location after scanning."""
+    db = get_db()
+    try:
+        inv = db.query(MaterialInventory).get(item_id)
+        if not inv:
+            raise HTTPException(404, "Item not found")
+        inv.location = location
+        db.commit()
+        return {"success": True, "location": location}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+@router.get("/inventory-v2/barcode/{barcode}")
+def lookup_inventory_by_barcode(barcode: str):
+    """Look up inventory item by barcode."""
+    db = get_db()
+    try:
+        inv = db.query(MaterialInventory).filter(MaterialInventory.barcode == barcode.upper()).first()
+        if not inv:
+            raise HTTPException(404, "Inventory item not found")
+        return _inv_to_dict(inv, db)
     finally:
         db.close()
 
@@ -2331,7 +2367,7 @@ def use_inventory_for_project(project_id: int, data: dict = Body(...)):
                 # Split
                 inv.quantity = total - use_qty
                 new_inv = MaterialInventory(
-                    barcode=generate_barcode(),
+                    barcode=_generate_inv_barcode(),
                     source_type=inv.source_type,
                     member_size=inv.member_size,
                     shape=inv.shape,

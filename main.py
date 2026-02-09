@@ -953,9 +953,42 @@ def scan_barcode(data: ScanCreate):
 
 @app.post("/api/scan/lookup")
 def scan_lookup(qr_data: str = Form(...)):
-    """Look up assembly by QR code content."""
+    """Look up assembly or inventory item by QR code content."""
     db = SessionLocal()
     try:
+        # Check if it's an inventory barcode first (INV-XXXXX or any non-assembly format)
+        from models_phase25 import MaterialInventory
+        inv = db.query(MaterialInventory).filter(MaterialInventory.barcode == qr_data.upper()).first()
+        if inv:
+            proj_name = None
+            if inv.reserved_project_id:
+                proj = db.query(Project).get(inv.reserved_project_id)
+                if proj:
+                    proj_name = f"{proj.job_number} - {proj.project_name}"
+            return {
+                "type": "inventory",
+                "inventory": {
+                    "id": inv.id,
+                    "barcode": inv.barcode,
+                    "shape": inv.shape,
+                    "dimensions": inv.dimensions,
+                    "member_size": inv.member_size,
+                    "grade": inv.grade,
+                    "length_display": inv.length_display,
+                    "length_inches": float(inv.length_inches) if inv.length_inches else 0,
+                    "width_inches": float(inv.width_inches) if inv.width_inches else None,
+                    "quantity": inv.quantity or 1,
+                    "weight": float(inv.weight) if inv.weight else 0,
+                    "heat_number": inv.heat_number,
+                    "location": inv.location,
+                    "status": inv.status,
+                    "source_type": inv.source_type,
+                    "reserved_project": proj_name,
+                    "added_date": inv.added_date.isoformat() if inv.added_date else None,
+                    "notes": inv.notes,
+                },
+            }
+
         # QR format: SSE|JOB_NUM|MARK|DB_ID
         parts = qr_data.split("|")
         if len(parts) >= 4 and parts[0] == "SSE":
@@ -981,6 +1014,7 @@ def scan_lookup(qr_data: str = Form(...)):
         ).order_by(desc(ScanEvent.scanned_at)).limit(20).all()
         
         return {
+            "type": "assembly",
             "assembly": _assembly_dict(assembly),
             "project": {
                 "job_number": project.job_number if project else "",
