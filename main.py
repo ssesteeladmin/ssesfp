@@ -59,6 +59,8 @@ async def lifespan(app: FastAPI):
         migrations = [
             ("tracker_projects", "archived", "BOOLEAN DEFAULT FALSE"),
             ("tracker_projects", "project_manager", "VARCHAR"),
+            ("tracker_parts", "is_hardware", "BOOLEAN DEFAULT FALSE"),
+            ("tracker_parts", "is_main_member", "BOOLEAN DEFAULT FALSE"),
         ]
         for table, col, col_type in migrations:
             try:
@@ -67,6 +69,14 @@ async def lifespan(app: FastAPI):
                 print(f"  ✅ Added {table}.{col}")
             except Exception:
                 conn.rollback()  # column already exists, skip
+
+        # Backfill NULLs to FALSE for boolean columns
+        for table, col in [("tracker_parts", "is_hardware"), ("tracker_parts", "is_main_member"), ("tracker_projects", "archived")]:
+            try:
+                conn.execute(text(f"UPDATE {table} SET {col} = FALSE WHERE {col} IS NULL"))
+                conn.commit()
+            except Exception:
+                conn.rollback()
 
     # Seed stock library
     db = SessionLocal()
