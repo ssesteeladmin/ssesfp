@@ -1076,12 +1076,13 @@ def create_manual_po(project_id: int, data: ManualPOCreate):
 
         count = db.query(POv2).filter(POv2.job_id == project_id).count()
         po_number = f"{project.job_number}-PO{count + 1:02d}"
-        vendor = db.query(Vendor).get(data.vendor_id) if data.vendor_id else None
+        vid = data.vendor_id if data.vendor_id and data.vendor_id > 0 else None
+        vendor = db.query(Vendor).get(vid) if vid else None
 
         po = POv2(
             job_id=project_id,
             po_number=po_number,
-            vendor_id=data.vendor_id,
+            vendor_id=vid,
             ordered_by=data.ordered_by,
             order_date=date.today(),
             terms=data.terms or (vendor.default_terms if vendor else "Net 45 days"),
@@ -1097,16 +1098,17 @@ def create_manual_po(project_id: int, data: ManualPOCreate):
         for item_data in data.items:
             line += 1
             barcode = generate_barcode()
+            raw_cost = item_data.get("unit_cost")
             poi = POItemv2(
                 po_id=po.id,
                 line_number=line,
-                qty=item_data.get("qty", 1),
+                qty=int(item_data.get("qty") or 1),
                 shape=item_data.get("shape", ""),
                 dimensions=item_data.get("dimensions", ""),
                 grade=item_data.get("grade", ""),
                 length_display=item_data.get("length_display", ""),
                 job_number=project.job_number,
-                unit_cost=item_data.get("unit_cost"),
+                unit_cost=float(raw_cost) if raw_cost and str(raw_cost).strip() else None,
                 unit_type=item_data.get("unit_type", "ea"),
                 receiving_barcode=barcode,
             )
