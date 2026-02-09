@@ -737,7 +737,7 @@ def delete_nest_run(nest_run_id: int):
                     MaterialInventory.source_type == "drop",
                     MaterialInventory.shape == d.shape,
                     MaterialInventory.dimensions == d.dimensions,
-                    MaterialInventory.drop_length_inches == d.drop_length_inches,
+                    MaterialInventory.length_inches == d.drop_length_inches,
                 ).delete()
             db.delete(d)
 
