@@ -720,6 +720,89 @@ def list_nest_runs(project_id: int):
         db.close()
 
 
+@router.delete("/nest-runs/{nest_run_id}")
+def delete_nest_run(nest_run_id: int):
+    """Delete an entire nest run — unlocks all parts so they can be re-nested."""
+    db = get_db()
+    try:
+        nr = db.query(NestRun).get(nest_run_id)
+        if not nr:
+            raise HTTPException(404, "Nest run not found")
+
+        # Delete drops (and any inventory created from them)
+        drops = db.query(NestRunDrop).filter(NestRunDrop.nest_run_id == nest_run_id).all()
+        for d in drops:
+            if d.disposition == "inventory":
+                db.query(MaterialInventory).filter(
+                    MaterialInventory.source_type == "drop",
+                    MaterialInventory.shape == d.shape,
+                    MaterialInventory.dimensions == d.dimensions,
+                    MaterialInventory.drop_length_inches == d.drop_length_inches,
+                ).delete()
+            db.delete(d)
+
+        # Delete nest items
+        items = db.query(NestRunItem).filter(NestRunItem.nest_run_id == nest_run_id).all()
+        part_ids_freed = set(i.part_id for i in items)
+        db.query(NestRunItem).filter(NestRunItem.nest_run_id == nest_run_id).delete()
+
+        # Delete the nest run itself
+        db.delete(nr)
+        db.commit()
+
+        return {
+            "success": True,
+            "parts_freed": len(part_ids_freed),
+            "message": f"Nest run deleted. {len(part_ids_freed)} parts unlocked for re-nesting."
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Unnest error: {str(e)}")
+    finally:
+        db.close()
+
+
+class UnnestPartsRequest(BaseModel):
+    part_ids: List[int]
+
+
+@router.post("/unnest-parts")
+def unnest_parts(data: UnnestPartsRequest):
+    """Unnest specific parts — removes them from their nest run items."""
+    db = get_db()
+    try:
+        freed = 0
+        affected_runs = set()
+        for pid in data.part_ids:
+            items = db.query(NestRunItem).filter(NestRunItem.part_id == pid).all()
+            for item in items:
+                affected_runs.add(item.nest_run_id)
+                db.delete(item)
+                freed += 1
+
+        # Update counts on affected nest runs
+        for nr_id in affected_runs:
+            remaining = db.query(NestRunItem).filter(NestRunItem.nest_run_id == nr_id).count()
+            nr = db.query(NestRun).get(nr_id)
+            if nr:
+                if remaining == 0:
+                    # No items left — delete the whole run and its drops
+                    db.query(NestRunDrop).filter(NestRunDrop.nest_run_id == nr_id).delete()
+                    db.delete(nr)
+                else:
+                    nr.total_parts_cut = remaining
+
+        db.commit()
+        return {"success": True, "parts_freed": freed}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Unnest error: {str(e)}")
+    finally:
+        db.close()
+
+
 # ═══════════════════════════════════════════════════════════════
 #  DROP DISPOSITION (Operator)
 # ═══════════════════════════════════════════════════════════════
