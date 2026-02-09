@@ -189,6 +189,47 @@ class RFQItemv2(Base):
     rfq = relationship("RFQv2", back_populates="items")
 
 
+# ─── RFQ VENDOR QUOTES (for comparison) ─────────────────────
+
+class RFQQuote(Base):
+    """Vendor quote uploaded against an RFQ for comparison."""
+    __tablename__ = "tracker_rfq_quotes"
+    id = Column(Integer, primary_key=True)
+    rfq_id = Column(Integer, ForeignKey("tracker_rfqs_v2.id"))
+    vendor_id = Column(Integer, ForeignKey("tracker_vendors.id"))
+    quote_date = Column(Date)
+    expiry_date = Column(Date)
+    sub_total = Column(Numeric(12, 2), default=0)
+    tax = Column(Numeric(10, 2), default=0)
+    freight = Column(Numeric(10, 2), default=0)
+    total_price = Column(Numeric(12, 2), default=0)
+    lead_time_days = Column(Integer)
+    terms = Column(String(100))
+    notes = Column(Text)
+    quote_pdf = Column(Text)  # base64 encoded PDF
+    quote_filename = Column(String(500))
+    is_selected = Column(Boolean, default=False)  # winner
+    created_at = Column(DateTime, default=datetime.utcnow)
+    # Relationships
+    vendor = relationship("Vendor", foreign_keys=[vendor_id])
+    line_items = relationship("RFQQuoteItem", back_populates="quote", cascade="all, delete-orphan")
+
+
+class RFQQuoteItem(Base):
+    """Line item pricing from a vendor quote."""
+    __tablename__ = "tracker_rfq_quote_items"
+    id = Column(Integer, primary_key=True)
+    quote_id = Column(Integer, ForeignKey("tracker_rfq_quotes.id"))
+    rfq_item_id = Column(Integer, ForeignKey("tracker_rfq_items_v2.id"), nullable=True)
+    line_number = Column(Integer)
+    description = Column(String(255))
+    qty = Column(Integer, default=1)
+    unit_price = Column(Numeric(10, 2))
+    unit_type = Column(String(10), default="CWT")
+    total_price = Column(Numeric(12, 2))
+    quote = relationship("RFQQuote", back_populates="line_items")
+
+
 # ─── ENHANCED PURCHASE ORDER ──────────────────────────────────
 
 class POv2(Base):

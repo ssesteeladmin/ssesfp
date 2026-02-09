@@ -27,13 +27,13 @@ from models import (
     ScanEvent, Inspection, Shipment, ShipmentItem,
     PurchaseOrder, POItem, AuditLog,
     Inventory, StockLengthConfig, RFQ, RFQItem,
-    Transmittal, RFI, ChangeOrder
+    Transmittal, RFI, ChangeOrder, DocAttachment
 )
 from xml_parser import parse_tekla_xml, generate_qr_content
 from routes_phase2 import router as phase2_router, set_session
 from routes_phase25 import router as phase25_router, set_session as set_session_25
 import models_phase25  # ensure tables are created
-from models_phase25 import seed_stock_config, StockConfig
+from models_phase25 import seed_stock_config, StockConfig, RFQQuote, RFQQuoteItem
 
 # ─── CONFIG ──────────────────────────────────────────────
 
@@ -122,6 +122,7 @@ class ProjectCreate(BaseModel):
     galvanizer_id: Optional[int] = None
     erector_id: Optional[int] = None
     finish_type: str = "None"
+    project_manager: str = ""
     po_number: str = ""
     ship_to_address: str = ""
     notes: str = ""
@@ -317,10 +318,12 @@ def create_contact(data: ContactCreate):
 # ─── PROJECTS ────────────────────────────────────────────
 
 @app.get("/api/projects")
-def list_projects(status: Optional[str] = None):
+def list_projects(status: Optional[str] = None, include_archived: bool = False):
     db = SessionLocal()
     try:
         q = db.query(Project)
+        if not include_archived:
+            q = q.filter(or_(Project.archived == False, Project.archived.is_(None)))
         if status:
             q = q.filter(Project.status == status)
         projects = q.order_by(desc(Project.created_at)).all()
@@ -421,6 +424,51 @@ def update_project(project_id: int, data: ProjectCreate):
     finally:
         db.close()
 
+
+@app.put("/api/projects/{project_id}/archive")
+def archive_project(project_id: int):
+    db = SessionLocal()
+    try:
+        p = db.query(Project).get(project_id)
+        if not p:
+            raise HTTPException(404)
+        p.archived = True
+        p.updated_at = datetime.utcnow()
+        db.commit()
+        return {"success": True}
+    finally:
+        db.close()
+
+
+@app.put("/api/projects/{project_id}/unarchive")
+def unarchive_project(project_id: int):
+    db = SessionLocal()
+    try:
+        p = db.query(Project).get(project_id)
+        if not p:
+            raise HTTPException(404)
+        p.archived = False
+        p.updated_at = datetime.utcnow()
+        db.commit()
+        return {"success": True}
+    finally:
+        db.close()
+
+
+@app.delete("/api/projects/{project_id}")
+def delete_project(project_id: int):
+    db = SessionLocal()
+    try:
+        p = db.query(Project).get(project_id)
+        if not p:
+            raise HTTPException(404)
+        db.delete(p)
+        db.commit()
+        return {"success": True}
+    finally:
+        db.close()
+
+
 # ─── XML IMPORT ──────────────────────────────────────────
 
 @app.post("/api/projects/create-from-xml")
@@ -429,6 +477,7 @@ async def create_project_from_xml(
     project_name: str = Form(""),
     customer_id: Optional[int] = Form(None),
     finish_type: str = Form(""),
+    project_manager: str = Form(""),
     start_date: str = Form(""),
     due_date: str = Form(""),
 ):
@@ -480,6 +529,7 @@ async def create_project_from_xml(
             project_name=project_name,
             customer_id=customer_id if customer_id and customer_id > 0 else None,
             finish_type=finish_type,
+            project_manager=project_manager,
             start_date=date.fromisoformat(start_date) if start_date else None,
             due_date=date.fromisoformat(due_date) if due_date else None,
         )
@@ -1525,6 +1575,8 @@ def _project_dict(p):
         "finish_type": p.finish_type, "contract_weight": p.contract_weight,
         "po_number": p.po_number, "ship_to_address": p.ship_to_address,
         "notes": p.notes, "status": p.status,
+        "archived": getattr(p, 'archived', False) or False,
+        "project_manager": getattr(p, 'project_manager', '') or '',
         "start_date": p.start_date.isoformat() if p.start_date else None,
         "due_date": p.due_date.isoformat() if p.due_date else None,
         "created_at": p.created_at.isoformat() if p.created_at else None,

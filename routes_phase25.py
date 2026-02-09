@@ -3,6 +3,7 @@ SSE Steel Project Tracker - Phase 2.5 Routes
 Procurement-to-Production Material Lifecycle
 """
 import os
+import io
 import json
 import uuid
 import math
@@ -19,8 +20,9 @@ from models import (
 from models_phase25 import (
     Vendor, NestRun, NestRunItem, NestRunDrop,
     RFQv2, RFQItemv2, POv2, POItemv2,
+    RFQQuote, RFQQuoteItem,
     YardTag, DropTag, MaterialInventory,
-    DocumentPacket, PacketAttachment,
+    DocumentPacket, PacketAttachment, StockConfig,
     generate_barcode
 )
 # nesting is handled inline in run_nest endpoint
@@ -697,6 +699,7 @@ def list_rfqs(project_id: int):
                 "vendor_id": r.vendor_id,
                 "status": r.status,
                 "item_count": len(items),
+                "quote_count": db.query(RFQQuote).filter(RFQQuote.rfq_id == r.id).count(),
                 "total_price": float(r.total_price) if r.total_price else 0,
                 "created_at": r.created_at.isoformat() if r.created_at else None,
             })
@@ -797,6 +800,172 @@ def update_rfq_status(rfq_id: int, status: str = Form(...)):
 
 
 # ═══════════════════════════════════════════════════════════════
+#  RFQ QUOTE COMPARISON
+# ═══════════════════════════════════════════════════════════════
+
+@router.get("/rfqs/{rfq_id}/quotes")
+def list_rfq_quotes(rfq_id: int):
+    """List all vendor quotes for an RFQ."""
+    db = get_db()
+    try:
+        quotes = db.query(RFQQuote).filter(RFQQuote.rfq_id == rfq_id).order_by(RFQQuote.total_price).all()
+        return [{
+            "id": q.id,
+            "vendor_id": q.vendor_id,
+            "vendor_name": q.vendor.name if q.vendor else "Unknown",
+            "quote_date": q.quote_date.isoformat() if q.quote_date else None,
+            "expiry_date": q.expiry_date.isoformat() if q.expiry_date else None,
+            "sub_total": float(q.sub_total or 0),
+            "tax": float(q.tax or 0),
+            "freight": float(q.freight or 0),
+            "total_price": float(q.total_price or 0),
+            "lead_time_days": q.lead_time_days,
+            "terms": q.terms,
+            "notes": q.notes,
+            "quote_filename": q.quote_filename,
+            "has_pdf": bool(q.quote_pdf),
+            "is_selected": q.is_selected,
+            "line_items": [{
+                "id": li.id, "line_number": li.line_number,
+                "description": li.description, "qty": li.qty,
+                "unit_price": float(li.unit_price or 0), "unit_type": li.unit_type,
+                "total_price": float(li.total_price or 0),
+            } for li in (q.line_items or [])],
+        } for q in quotes]
+    finally:
+        db.close()
+
+
+@router.post("/rfqs/{rfq_id}/quotes")
+async def upload_rfq_quote(
+    rfq_id: int,
+    vendor_id: int = Form(...),
+    sub_total: float = Form(0),
+    tax: float = Form(0),
+    freight: float = Form(0),
+    total_price: float = Form(0),
+    lead_time_days: int = Form(0),
+    terms: str = Form(""),
+    notes: str = Form(""),
+    quote_file: Optional[UploadFile] = File(None),
+):
+    """Upload a vendor quote against an RFQ."""
+    db = get_db()
+    try:
+        rfq = db.query(RFQv2).get(rfq_id)
+        if not rfq:
+            raise HTTPException(404, "RFQ not found")
+
+        import base64 as b64mod
+        pdf_data = None
+        filename = None
+        if quote_file and quote_file.filename:
+            content = await quote_file.read()
+            pdf_data = b64mod.b64encode(content).decode('utf-8')
+            filename = quote_file.filename
+
+        q = RFQQuote(
+            rfq_id=rfq_id,
+            vendor_id=vendor_id,
+            quote_date=date.today(),
+            sub_total=sub_total,
+            tax=tax,
+            freight=freight,
+            total_price=total_price if total_price > 0 else sub_total + tax + freight,
+            lead_time_days=lead_time_days,
+            terms=terms,
+            notes=notes,
+            quote_pdf=pdf_data,
+            quote_filename=filename,
+        )
+        db.add(q)
+        db.commit()
+        db.refresh(q)
+
+        # Auto-update RFQ status
+        rfq.status = "received"
+        db.commit()
+
+        return {"id": q.id, "vendor_name": q.vendor.name if q.vendor else ""}
+    finally:
+        db.close()
+
+
+@router.put("/rfq-quotes/{quote_id}/select")
+def select_rfq_quote(quote_id: int):
+    """Select a quote as the winner (deselects others on same RFQ)."""
+    db = get_db()
+    try:
+        q = db.query(RFQQuote).get(quote_id)
+        if not q:
+            raise HTTPException(404)
+        # Deselect all other quotes on this RFQ
+        db.query(RFQQuote).filter(RFQQuote.rfq_id == q.rfq_id).update({"is_selected": False})
+        q.is_selected = True
+        # Update RFQ with winning vendor and pricing
+        rfq = db.query(RFQv2).get(q.rfq_id)
+        if rfq:
+            rfq.vendor_id = q.vendor_id
+            rfq.sub_total = q.sub_total
+            rfq.tax = q.tax
+            rfq.freight = q.freight
+            rfq.total_price = q.total_price
+            rfq.status = "accepted"
+        db.commit()
+        return {"success": True}
+    finally:
+        db.close()
+
+
+@router.get("/rfq-quotes/{quote_id}/pdf")
+def get_rfq_quote_pdf(quote_id: int):
+    db = get_db()
+    try:
+        q = db.query(RFQQuote).get(quote_id)
+        if not q or not q.quote_pdf:
+            raise HTTPException(404)
+        return {"pdf_data": q.quote_pdf, "filename": q.quote_filename}
+    finally:
+        db.close()
+
+
+@router.get("/rfqs/{rfq_id}/comparison")
+def get_rfq_comparison(rfq_id: int):
+    """Get a comparison summary of all quotes for an RFQ."""
+    db = get_db()
+    try:
+        rfq = db.query(RFQv2).get(rfq_id)
+        if not rfq:
+            raise HTTPException(404)
+        quotes = db.query(RFQQuote).filter(RFQQuote.rfq_id == rfq_id).order_by(RFQQuote.total_price).all()
+        if not quotes:
+            return {"rfq_id": rfq_id, "quotes": [], "recommendation": None}
+
+        lowest = quotes[0]
+        return {
+            "rfq_id": rfq_id,
+            "rfq_number": rfq.rfq_number,
+            "quotes": [{
+                "id": q.id,
+                "vendor_name": q.vendor.name if q.vendor else "Unknown",
+                "total_price": float(q.total_price or 0),
+                "freight": float(q.freight or 0),
+                "lead_time_days": q.lead_time_days,
+                "terms": q.terms,
+                "is_selected": q.is_selected,
+                "savings_vs_highest": float((quotes[-1].total_price or 0) - (q.total_price or 0)) if len(quotes) > 1 else 0,
+            } for q in quotes],
+            "recommendation": {
+                "vendor_name": lowest.vendor.name if lowest.vendor else "Unknown",
+                "total_price": float(lowest.total_price or 0),
+                "reason": f"Lowest total price" + (f" with {lowest.lead_time_days} day lead time" if lowest.lead_time_days else ""),
+            }
+        }
+    finally:
+        db.close()
+
+
+# ═══════════════════════════════════════════════════════════════
 #  PURCHASE ORDERS
 # ═══════════════════════════════════════════════════════════════
 
@@ -864,6 +1033,111 @@ def convert_rfq_to_po(rfq_id: int, ordered_by: str = Form("")):
         db.commit()
 
         return {"po_id": po.id, "po_number": po_number}
+    finally:
+        db.close()
+
+
+@router.get("/projects/{project_id}/hardware-summary")
+def get_hardware_summary(project_id: int):
+    """Get a summary of all hardware items in a project, grouped by type/size."""
+    db = get_db()
+    try:
+        hw_parts = db.query(Part).join(Assembly).filter(
+            Assembly.project_id == project_id,
+            Part.is_hardware == True,
+        ).all()
+
+        groups = {}
+        for p in hw_parts:
+            asm = db.query(Assembly).get(p.assembly_id)
+            qty = p.quantity * (asm.assembly_quantity if asm else 1)
+            key = f"{p.shape}|{p.dimensions}|{p.grade}"
+            if key not in groups:
+                groups[key] = {
+                    "shape": p.shape, "dimensions": p.dimensions, "grade": p.grade or "",
+                    "length_display": p.length_display or "", "total_qty": 0, "parts": [],
+                }
+            groups[key]["total_qty"] += qty
+            groups[key]["parts"].append({
+                "part_mark": p.part_mark,
+                "assembly_mark": asm.assembly_mark if asm else "",
+                "qty": qty,
+            })
+        return list(groups.values())
+    finally:
+        db.close()
+
+
+@router.post("/projects/{project_id}/create-hardware-po")
+def create_hardware_po(
+    project_id: int,
+    vendor_id: int = Form(0),
+    ordered_by: str = Form(""),
+):
+    """Create a PO directly from hardware items (bypass nesting/RFQ)."""
+    db = get_db()
+    try:
+        project = db.query(Project).get(project_id)
+        if not project:
+            raise HTTPException(404)
+
+        hw_parts = db.query(Part).join(Assembly).filter(
+            Assembly.project_id == project_id,
+            Part.is_hardware == True,
+        ).all()
+
+        if not hw_parts:
+            raise HTTPException(400, "No hardware items in this project")
+
+        # Group by shape+dimensions+grade
+        groups = {}
+        for p in hw_parts:
+            asm = db.query(Assembly).get(p.assembly_id)
+            qty = p.quantity * (asm.assembly_quantity if asm else 1)
+            key = f"{p.shape}|{p.dimensions}|{p.grade}"
+            if key not in groups:
+                groups[key] = {
+                    "shape": p.shape, "dimensions": p.dimensions, "grade": p.grade or "",
+                    "length_display": p.length_display or "", "total_qty": 0,
+                }
+            groups[key]["total_qty"] += qty
+
+        count = db.query(POv2).filter(POv2.job_id == project_id).count()
+        po_number = f"{project.job_number}-PO{count + 1:02d}"
+
+        vendor = db.query(Vendor).get(vendor_id) if vendor_id and vendor_id > 0 else None
+
+        po = POv2(
+            job_id=project_id,
+            po_number=po_number,
+            vendor_id=vendor_id if vendor_id and vendor_id > 0 else None,
+            ordered_by=ordered_by,
+            order_date=date.today(),
+            terms=vendor.default_terms if vendor else "Net 45 days",
+            status="draft",
+        )
+        db.add(po)
+        db.flush()
+
+        line = 0
+        for key, g in groups.items():
+            line += 1
+            barcode = generate_barcode()
+            poi = POItemv2(
+                po_id=po.id,
+                line_number=line,
+                qty=g["total_qty"],
+                shape=g["shape"],
+                dimensions=g["dimensions"],
+                grade=g["grade"],
+                length_display=g["length_display"],
+                job_number=project.job_number,
+                receiving_barcode=barcode,
+            )
+            db.add(poi)
+
+        db.commit()
+        return {"po_id": po.id, "po_number": po_number, "items": line}
     finally:
         db.close()
 
@@ -1364,11 +1638,119 @@ def send_packet(packet_id: int):
         db.close()
 
 
+@router.get("/packet-attachments/{attachment_id}/download")
+def download_packet_attachment(attachment_id: int):
+    """Download a single packet attachment."""
+    db = get_db()
+    try:
+        a = db.query(PacketAttachment).get(attachment_id)
+        if not a or not a.file_data:
+            raise HTTPException(404)
+        return {"file_data": a.file_data, "filename": a.filename}
+    finally:
+        db.close()
+
+
+@router.delete("/packet-attachments/{attachment_id}")
+def delete_packet_attachment(attachment_id: int):
+    """Delete a packet attachment and update count."""
+    db = get_db()
+    try:
+        a = db.query(PacketAttachment).get(attachment_id)
+        if not a:
+            raise HTTPException(404)
+        packet = db.query(DocumentPacket).get(a.packet_id)
+        if packet:
+            packet.attachment_count = max((packet.attachment_count or 1) - 1, 0)
+        db.delete(a)
+        db.commit()
+        return {"success": True}
+    finally:
+        db.close()
+
+
+@router.post("/packets/{packet_id}/attach-drawings")
+def attach_drawings_to_packet(
+    packet_id: int,
+    drawing_ids: str = Form(""),
+):
+    """Attach project drawings to a transmittal packet."""
+    import base64 as b64mod
+    db = get_db()
+    try:
+        packet = db.query(DocumentPacket).get(packet_id)
+        if not packet:
+            raise HTTPException(404)
+
+        ids = [int(x.strip()) for x in drawing_ids.split(",") if x.strip()]
+        attached = 0
+
+        for did in ids:
+            dwg = db.query(Drawing).get(did)
+            if not dwg:
+                continue
+            # Skip if already attached
+            existing = db.query(PacketAttachment).filter(
+                PacketAttachment.packet_id == packet_id,
+                PacketAttachment.filename == f"{dwg.drawing_number}_Rev{dwg.current_revision or '0'}.pdf",
+            ).first()
+            if existing:
+                continue
+
+            att = PacketAttachment(
+                packet_id=packet_id,
+                filename=f"{dwg.drawing_number}_Rev{dwg.current_revision or '0'}.pdf",
+                file_data=dwg.pdf_data if dwg.pdf_data else None,
+                file_size=len(dwg.pdf_data or "") * 3 // 4,
+                sort_order=(packet.attachment_count or 0) + attached,
+            )
+            db.add(att)
+            attached += 1
+
+        packet.attachment_count = (packet.attachment_count or 0) + attached
+        db.commit()
+        return {"attached": attached, "total": packet.attachment_count}
+    finally:
+        db.close()
+
+
+@router.get("/packets/{packet_id}/download-zip")
+def download_packet_zip(packet_id: int):
+    """Download all packet attachments as a zip (base64 encoded)."""
+    import zipfile as zf
+    import base64 as b64mod
+
+    db = get_db()
+    try:
+        packet = db.query(DocumentPacket).get(packet_id)
+        if not packet:
+            raise HTTPException(404)
+        atts = db.query(PacketAttachment).filter(
+            PacketAttachment.packet_id == packet_id,
+        ).order_by(PacketAttachment.sort_order).all()
+
+        if not atts:
+            raise HTTPException(404, "No attachments")
+
+        buf = io.BytesIO()
+        with zf.ZipFile(buf, 'w', zf.ZIP_DEFLATED) as z:
+            for a in atts:
+                if a.file_data:
+                    z.writestr(a.filename or f"file_{a.id}", b64mod.b64decode(a.file_data))
+        buf.seek(0)
+
+        zip_b64 = b64mod.b64encode(buf.getvalue()).decode('utf-8')
+        return {
+            "zip_data": zip_b64,
+            "filename": f"{packet.doc_number or 'document'}.zip",
+        }
+    finally:
+        db.close()
+
+
 # ═══════════════════════════════════════════════════════════════
 #  STOCK SIZE LIBRARY
 # ═══════════════════════════════════════════════════════════════
-
-from models_phase25 import StockConfig
 
 @router.get("/stock-config")
 def list_stock_config():

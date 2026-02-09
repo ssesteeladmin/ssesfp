@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from models import (
     Project, Drawing, DrawingRevision, Assembly, Part, Company, Contact,
     Inventory, StockLengthConfig, RFQ, RFQItem,
-    Transmittal, RFI, ChangeOrder, PurchaseOrder, POItem
+    Transmittal, RFI, ChangeOrder, PurchaseOrder, POItem, DocAttachment
 )
 from nesting import nest_linear, CutPiece, generate_rfq, DEFAULT_STOCK_LENGTHS
 
@@ -725,5 +725,179 @@ def approve_change_order(co_id: int, approved_by: str = Form("")):
         co.approved_by = approved_by
         db.commit()
         return {"success": True}
+    finally:
+        db.close()
+
+
+# ═══════════════════════════════════════════════════════════
+#  FILE ATTACHMENTS (Transmittals, RFIs, Change Orders)
+# ═══════════════════════════════════════════════════════════
+
+@router.get("/doc-attachments/{parent_type}/{parent_id}")
+def list_doc_attachments(parent_type: str, parent_id: int):
+    """List attachments for a transmittal, rfi, or change_order."""
+    db = get_db()
+    try:
+        atts = db.query(DocAttachment).filter(
+            DocAttachment.parent_type == parent_type,
+            DocAttachment.parent_id == parent_id,
+        ).order_by(DocAttachment.sort_order).all()
+        return [{
+            "id": a.id, "filename": a.filename,
+            "file_size": a.file_size, "file_type": a.file_type,
+            "is_drawing": a.is_drawing, "drawing_id": a.drawing_id,
+            "uploaded_at": a.uploaded_at.isoformat() if a.uploaded_at else None,
+        } for a in atts]
+    finally:
+        db.close()
+
+
+@router.post("/doc-attachments/{parent_type}/{parent_id}")
+async def upload_doc_attachment(
+    parent_type: str, parent_id: int,
+    file: UploadFile = File(...),
+):
+    """Upload a file attachment."""
+    import base64 as b64mod
+    db = get_db()
+    try:
+        content = await file.read()
+        encoded = b64mod.b64encode(content).decode('utf-8')
+        ext = (file.filename or "").rsplit(".", 1)[-1].lower() if "." in (file.filename or "") else "bin"
+
+        att = DocAttachment(
+            parent_type=parent_type,
+            parent_id=parent_id,
+            filename=file.filename,
+            file_data=encoded,
+            file_size=len(content),
+            file_type=ext,
+        )
+        db.add(att)
+        db.commit()
+        db.refresh(att)
+        return {"id": att.id, "filename": att.filename, "file_size": att.file_size}
+    finally:
+        db.close()
+
+
+@router.delete("/doc-attachments/{attachment_id}")
+def delete_doc_attachment(attachment_id: int):
+    db = get_db()
+    try:
+        att = db.query(DocAttachment).get(attachment_id)
+        if not att:
+            raise HTTPException(404)
+        db.delete(att)
+        db.commit()
+        return {"success": True}
+    finally:
+        db.close()
+
+
+@router.get("/doc-attachments/{attachment_id}/download")
+def download_doc_attachment(attachment_id: int):
+    db = get_db()
+    try:
+        att = db.query(DocAttachment).get(attachment_id)
+        if not att or not att.file_data:
+            raise HTTPException(404)
+        return {"file_data": att.file_data, "filename": att.filename, "file_type": att.file_type}
+    finally:
+        db.close()
+
+
+# ═══════════════════════════════════════════════════════════
+#  TRANSMITTAL DRAWING ATTACHMENTS
+# ═══════════════════════════════════════════════════════════
+
+@router.post("/transmittals/{transmittal_id}/attach-drawings")
+def attach_drawings_to_transmittal(
+    transmittal_id: int,
+    drawing_ids: str = Form(""),  # comma-separated drawing IDs
+):
+    """Attach project drawings to a transmittal."""
+    import base64 as b64mod
+    db = get_db()
+    try:
+        t = db.query(Transmittal).get(transmittal_id)
+        if not t:
+            raise HTTPException(404)
+
+        ids = [int(x.strip()) for x in drawing_ids.split(",") if x.strip()]
+        attached = 0
+        dwg_numbers = []
+
+        for did in ids:
+            dwg = db.query(Drawing).get(did)
+            if not dwg:
+                continue
+
+            # Check if already attached
+            existing = db.query(DocAttachment).filter(
+                DocAttachment.parent_type == "transmittal",
+                DocAttachment.parent_id == transmittal_id,
+                DocAttachment.drawing_id == did,
+            ).first()
+            if existing:
+                continue
+
+            att = DocAttachment(
+                parent_type="transmittal",
+                parent_id=transmittal_id,
+                filename=f"{dwg.drawing_number}.pdf",
+                file_data=dwg.pdf_data if dwg.pdf_data else None,
+                file_size=len(dwg.pdf_data or "") * 3 // 4,  # approx decoded size
+                file_type="pdf",
+                is_drawing=True,
+                drawing_id=did,
+            )
+            db.add(att)
+            attached += 1
+            dwg_numbers.append(dwg.drawing_number)
+
+        # Update transmittal drawing numbers
+        existing_nums = (t.drawing_numbers or "").split(",") if t.drawing_numbers else []
+        existing_nums = [x.strip() for x in existing_nums if x.strip()]
+        all_nums = list(set(existing_nums + dwg_numbers))
+        t.drawing_numbers = ", ".join(sorted(all_nums))
+
+        db.commit()
+        return {"attached": attached, "drawing_numbers": dwg_numbers}
+    finally:
+        db.close()
+
+
+@router.get("/transmittals/{transmittal_id}/download-zip")
+def download_transmittal_zip(transmittal_id: int):
+    """Download transmittal with attached drawings as zip (base64 encoded)."""
+    import zipfile
+    import base64 as b64mod
+    db = get_db()
+    try:
+        t = db.query(Transmittal).get(transmittal_id)
+        if not t:
+            raise HTTPException(404)
+
+        atts = db.query(DocAttachment).filter(
+            DocAttachment.parent_type == "transmittal",
+            DocAttachment.parent_id == transmittal_id,
+        ).all()
+
+        if not atts:
+            raise HTTPException(404, "No attachments to download")
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for att in atts:
+                if att.file_data:
+                    zf.writestr(att.filename or f"file_{att.id}", b64mod.b64decode(att.file_data))
+        buf.seek(0)
+
+        zip_b64 = b64mod.b64encode(buf.getvalue()).decode('utf-8')
+        return {
+            "zip_data": zip_b64,
+            "filename": f"{t.transmittal_number or 'transmittal'}.zip",
+        }
     finally:
         db.close()

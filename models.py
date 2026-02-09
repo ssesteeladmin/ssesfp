@@ -136,6 +136,8 @@ class Project(Base):
     ship_to_address = Column(Text)
     notes = Column(Text)
     status = Column(String(50), default="Active")  # Active, Complete, Hold, Cancelled
+    archived = Column(Boolean, default=False)
+    project_manager = Column(String(200))
     start_date = Column(Date)
     due_date = Column(Date)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -508,3 +510,24 @@ class ChangeOrder(Base):
     approved_by = Column(String(255))
     notes = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+# ─── GENERIC DOCUMENT ATTACHMENTS ────────────────────────
+
+class DocAttachment(Base):
+    """Generic file attachment for transmittals, RFIs, change orders."""
+    __tablename__ = "tracker_doc_attachments"
+    id = Column(Integer, primary_key=True)
+    parent_type = Column(String(20), nullable=False)  # transmittal, rfi, change_order
+    parent_id = Column(Integer, nullable=False)
+    filename = Column(String(500))
+    file_data = Column(Text)  # base64 encoded
+    file_size = Column(Integer, default=0)
+    file_type = Column(String(50))  # pdf, jpg, png, dwg, etc.
+    is_drawing = Column(Boolean, default=False)  # if this is a project drawing attachment
+    drawing_id = Column(Integer, ForeignKey("tracker_drawings.id"), nullable=True)
+    sort_order = Column(Integer, default=0)
+    uploaded_at = Column(DateTime, default=datetime.utcnow)
+    __table_args__ = (
+        Index("idx_doc_attachment_parent", "parent_type", "parent_id"),
+    )
