@@ -1270,11 +1270,11 @@ def scan_to_load(data: ScanToLoadCreate):
         
         # Update assembly station
         if shipment.destination == "galvanizer":
-            assembly.current_station = "Galvanize - Sent Out"
+            assembly.current_station = "Shipped - To Coater"
         elif shipment.destination == "painter":
-            assembly.current_station = "Paint - Sent Out"
+            assembly.current_station = "Shipped - To Coater"
         else:
-            assembly.current_station = "Shipped"
+            assembly.current_station = "Shipped - To Customer"
         
         # Update shipment totals
         shipment.total_pieces = (shipment.total_pieces or 0) + 1
@@ -1303,21 +1303,92 @@ def list_shipments(project_id: int):
         result = []
         for s in shipments:
             items = db.query(ShipmentItem).filter(ShipmentItem.shipment_id == s.id).all()
+            enriched_items = []
+            for i in items:
+                asm = db.query(Assembly).get(i.assembly_id) if i.assembly_id else None
+                enriched_items.append({
+                    "id": i.id,
+                    "assembly_id": i.assembly_id,
+                    "assembly_mark": asm.assembly_mark if asm else "?",
+                    "assembly_name": asm.assembly_name if asm else "",
+                    "weight": asm.assembly_weight if asm else 0,
+                    "qty": asm.assembly_quantity if asm else 1,
+                    "scanned_by": i.scanned_by,
+                })
             result.append({
                 "id": s.id,
                 "load_number": s.load_number,
                 "trailer_type": s.trailer_type,
                 "carrier": s.carrier,
+                "driver_name": getattr(s, 'driver_name', ''),
+                "truck_number": getattr(s, 'truck_number', ''),
                 "destination": s.destination,
                 "status": s.status,
                 "total_pieces": s.total_pieces,
                 "total_weight": s.total_weight,
                 "ship_date": s.ship_date.isoformat() if s.ship_date else None,
-                "items": [{"assembly_id": i.assembly_id, "scanned_by": i.scanned_by} for i in items]
+                "items": enriched_items,
             })
         return result
     finally:
         db.close()
+
+
+@app.get("/api/projects/{project_id}/shippable-assemblies")
+def get_shippable_assemblies(project_id: int):
+    """Get assemblies that can be added to a load (not already on one)."""
+    db = SessionLocal()
+    try:
+        # Get all assembly IDs already on a shipment
+        on_loads = set(
+            r[0] for r in db.query(ShipmentItem.assembly_id).all() if r[0]
+        )
+        assemblies = db.query(Assembly).filter(
+            Assembly.project_id == project_id
+        ).order_by(Assembly.assembly_mark).all()
+
+        result = []
+        for a in assemblies:
+            result.append({
+                "id": a.id,
+                "assembly_mark": a.assembly_mark,
+                "assembly_name": a.assembly_name or "",
+                "assembly_quantity": a.assembly_quantity or 1,
+                "weight": a.assembly_weight or 0,
+                "current_station": a.current_station or "",
+                "finish_type": a.finish_type or "",
+                "on_load": a.id in on_loads,
+            })
+        return result
+    finally:
+        db.close()
+
+@app.delete("/api/shipments/{shipment_id}/items/{item_id}")
+def remove_from_load(shipment_id: int, item_id: int):
+    """Remove an assembly from a shipment load."""
+    db = SessionLocal()
+    try:
+        item = db.query(ShipmentItem).get(item_id)
+        if not item or item.shipment_id != shipment_id:
+            raise HTTPException(404, "Item not found")
+        shipment = db.query(Shipment).get(shipment_id)
+        if shipment.status != "Loading":
+            raise HTTPException(400, "Cannot modify shipped load")
+
+        # Revert assembly station
+        asm = db.query(Assembly).get(item.assembly_id) if item.assembly_id else None
+        if asm:
+            asm.current_station = "Ready to Ship"
+            shipment.total_pieces = max(0, (shipment.total_pieces or 0) - 1)
+            if asm.assembly_weight:
+                shipment.total_weight = max(0, (shipment.total_weight or 0) - asm.assembly_weight)
+
+        db.delete(item)
+        db.commit()
+        return {"success": True, "total_pieces": shipment.total_pieces, "total_weight": shipment.total_weight}
+    finally:
+        db.close()
+
 
 @app.put("/api/shipments/{shipment_id}/ship")
 def mark_shipped(shipment_id: int):
