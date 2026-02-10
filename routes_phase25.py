@@ -247,6 +247,7 @@ def get_nestable_shapes(project_id: int):
 class NestRequest(BaseModel):
     part_ids: List[int]
     stock_length_inches: float = 0  # 0 = auto from stock config
+    stock_overrides: dict = {}  # {"HSS": [20, 24], "PIPE": [21]} - override per shape (feet)
     operator: str = ""
     machine: str = ""
     nest_mode: str = "mult"  # mult, plate, both
@@ -315,6 +316,7 @@ def run_nest(project_id: int, data: NestRequest):
                      "PIPE": "PIPE", "L": "L", "C": "C", "MC": "MC", "S": "S", "PL": "PL", "PLATE": "PL"}
 
         all_results = []
+        warnings = []
         total_used = 0
         total_material = 0
         buy_list = []  # consolidated purchase list
@@ -482,12 +484,31 @@ def run_nest(project_id: int, data: NestRequest):
                     continue
 
                 # Get available stock lengths in inches
-                if data.stock_length_inches > 0:
+                shape_upper = (group["shape"] or "").upper()
+                if shape_upper in data.stock_overrides and data.stock_overrides[shape_upper]:
+                    # Manual override for this specific shape
+                    avail_inches = sorted([l * 12 for l in data.stock_overrides[shape_upper]])
+                elif data.stock_length_inches > 0:
                     avail_inches = [data.stock_length_inches]
                 elif stock_cfg and stock_cfg.available_lengths:
                     avail_inches = sorted([l * 12 for l in stock_cfg.available_lengths])
                 else:
                     avail_inches = [480]  # 40ft default
+
+                max_stock = max(avail_inches)
+
+                # ⚠️ Check for oversized parts
+                for ci, cl in enumerate(cut_lengths):
+                    if cl > max_stock:
+                        warnings.append({
+                            "type": "oversized",
+                            "shape": group["shape"],
+                            "dimensions": group["dimensions"],
+                            "part_mark": part_refs[ci].get("part_mark", ""),
+                            "part_length_ft": round(cl / 12, 1),
+                            "max_stock_ft": round(max_stock / 12, 1),
+                            "message": f"⚠️ {group['shape']} {group['dimensions']} part {part_refs[ci].get('part_mark', '')} is {round(cl / 12, 1)}' — exceeds max stock length of {round(max_stock / 12, 1)}'",
+                        })
 
                 # Mixed-length best-fit-decreasing bin packing
                 indexed = sorted(enumerate(cut_lengths), key=lambda x: -x[1])
@@ -647,6 +668,7 @@ def run_nest(project_id: int, data: NestRequest):
                 # For mult: show mixed lengths used
                 "stock_lengths": list(set(round(b["stock_length"] / 12, 1) for b in r["bins"])) if not r.get("is_plate") else [],
             } for r in all_results],
+            "warnings": warnings,
         }
     except HTTPException:
         raise

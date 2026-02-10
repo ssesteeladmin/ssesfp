@@ -138,6 +138,8 @@ class Project(Base):
     status = Column(String(50), default="Active")  # Active, Complete, Hold, Cancelled
     archived = Column(Boolean, default=False)
     project_manager = Column(String(200))
+    completed_date = Column(DateTime, nullable=True)
+    completed_by = Column(String(100), nullable=True)
     start_date = Column(Date)
     due_date = Column(Date)
     created_at = Column(DateTime, default=datetime.utcnow)

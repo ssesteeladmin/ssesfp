@@ -7,7 +7,7 @@ import json
 import csv
 import io
 import base64
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Optional, List
 from contextlib import asynccontextmanager
 
@@ -69,6 +69,8 @@ async def lifespan(app: FastAPI):
             ("tracker_material_inventory", "reserved_project_id", "INTEGER"),
             ("tracker_material_inventory", "reserved_date", "TIMESTAMP"),
             ("tracker_material_inventory", "reserved_by", "VARCHAR(100)"),
+            ("tracker_projects", "completed_date", "TIMESTAMP"),
+            ("tracker_projects", "completed_by", "VARCHAR(100)"),
         ]
         for table, col, col_type in migrations:
             try:
@@ -95,6 +97,28 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
     print("✅ Database tables created/verified")
+
+    # Auto-archive projects completed > 60 days ago
+    db = SessionLocal()
+    try:
+        cutoff = datetime.utcnow() - timedelta(days=60)
+        auto_archived = db.query(Project).filter(
+            Project.status == "Complete",
+            Project.archived == False,
+            Project.completed_date != None,
+            Project.completed_date < cutoff,
+        ).all()
+        for p in auto_archived:
+            p.archived = True
+            p.updated_at = datetime.utcnow()
+        if auto_archived:
+            db.commit()
+            print(f"  📦 Auto-archived {len(auto_archived)} projects (>60 days complete)")
+    except Exception as e:
+        print(f"  ⚠️ Auto-archive: {e}")
+    finally:
+        db.close()
+
     yield
 
 app = FastAPI(title="SSE Steel Project Tracker", version="1.0.0", lifespan=lifespan)
@@ -484,6 +508,66 @@ def unarchive_project(project_id: int):
         p.updated_at = datetime.utcnow()
         db.commit()
         return {"success": True}
+    finally:
+        db.close()
+
+
+@app.put("/api/projects/{project_id}/complete")
+def complete_project(project_id: int, completed_by: str = ""):
+    """Mark project as complete. Auto-archives after 60 days."""
+    db = SessionLocal()
+    try:
+        p = db.query(Project).get(project_id)
+        if not p:
+            raise HTTPException(404)
+        p.status = "Complete"
+        p.completed_date = datetime.utcnow()
+        p.completed_by = completed_by
+        p.updated_at = datetime.utcnow()
+        db.commit()
+        return {"success": True, "completed_date": p.completed_date.isoformat()}
+    finally:
+        db.close()
+
+
+@app.put("/api/projects/{project_id}/reopen")
+def reopen_project(project_id: int):
+    """Reopen a completed/archived project."""
+    db = SessionLocal()
+    try:
+        p = db.query(Project).get(project_id)
+        if not p:
+            raise HTTPException(404)
+        p.status = "Active"
+        p.completed_date = None
+        p.completed_by = None
+        p.archived = False
+        p.updated_at = datetime.utcnow()
+        db.commit()
+        return {"success": True}
+    finally:
+        db.close()
+
+
+@app.post("/api/auto-archive")
+def auto_archive_projects(days: int = 60):
+    """Auto-archive projects completed more than N days ago."""
+    db = SessionLocal()
+    try:
+        cutoff = datetime.utcnow() - timedelta(days=days)
+        projects = db.query(Project).filter(
+            Project.status == "Complete",
+            Project.archived == False,
+            Project.completed_date != None,
+            Project.completed_date < cutoff,
+        ).all()
+        count = 0
+        for p in projects:
+            p.archived = True
+            p.updated_at = datetime.utcnow()
+            count += 1
+        db.commit()
+        return {"success": True, "archived_count": count}
     finally:
         db.close()
 
@@ -1648,6 +1732,8 @@ def _project_dict(p):
         "notes": p.notes, "status": p.status,
         "archived": getattr(p, 'archived', False) or False,
         "project_manager": getattr(p, 'project_manager', '') or '',
+        "completed_date": p.completed_date.isoformat() if getattr(p, 'completed_date', None) else None,
+        "completed_by": getattr(p, 'completed_by', '') or '',
         "start_date": p.start_date.isoformat() if p.start_date else None,
         "due_date": p.due_date.isoformat() if p.due_date else None,
         "created_at": p.created_at.isoformat() if p.created_at else None,
