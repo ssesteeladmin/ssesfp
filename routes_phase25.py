@@ -24,6 +24,7 @@ from models_phase25 import (
     YardTag, DropTag, MaterialInventory,
     DocumentPacket, PacketAttachment, StockConfig,
     ProductionFolder, ProductionFolderItem,
+    SOVLine, Invoice, InvoiceLineItem,
     generate_barcode
 )
 # nesting is handled inline in run_nest endpoint
@@ -3259,3 +3260,454 @@ def update_assembly_finish(assembly_id: int, finish_type: str = Form(...)):
         return {"success": True, "finish_type": finish_type}
     finally:
         db.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  AIA G702/G703 INVOICING
+# ═══════════════════════════════════════════════════════════════
+
+# ─── SCHEDULE OF VALUES (SOV) ───────────────────────────
+
+class SOVCreate(BaseModel):
+    item_number: str
+    description: str
+    scheduled_value: float = 0
+
+class SOVBulkCreate(BaseModel):
+    lines: List[SOVCreate]
+
+
+@router.get("/projects/{project_id}/sov")
+def get_sov(project_id: int):
+    """Get Schedule of Values for a project."""
+    db = get_db()
+    try:
+        lines = db.query(SOVLine).filter(
+            SOVLine.project_id == project_id
+        ).order_by(SOVLine.sort_order, SOVLine.id).all()
+        return [{
+            "id": l.id,
+            "item_number": l.item_number,
+            "description": l.description,
+            "scheduled_value": l.scheduled_value,
+            "sort_order": l.sort_order,
+        } for l in lines]
+    finally:
+        db.close()
+
+
+@router.post("/projects/{project_id}/sov")
+def create_sov_line(project_id: int, data: SOVCreate):
+    """Add a single SOV line item."""
+    db = get_db()
+    try:
+        max_order = db.query(func.max(SOVLine.sort_order)).filter(
+            SOVLine.project_id == project_id).scalar() or 0
+        line = SOVLine(
+            project_id=project_id,
+            item_number=data.item_number,
+            description=data.description,
+            scheduled_value=data.scheduled_value,
+            sort_order=max_order + 1,
+        )
+        db.add(line)
+        db.commit()
+        db.refresh(line)
+        return {"success": True, "id": line.id}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+@router.post("/projects/{project_id}/sov/bulk")
+def create_sov_bulk(project_id: int, data: SOVBulkCreate):
+    """Bulk create SOV lines."""
+    db = get_db()
+    try:
+        max_order = db.query(func.max(SOVLine.sort_order)).filter(
+            SOVLine.project_id == project_id).scalar() or 0
+        added = 0
+        for i, line in enumerate(data.lines):
+            sov = SOVLine(
+                project_id=project_id,
+                item_number=line.item_number,
+                description=line.description,
+                scheduled_value=line.scheduled_value,
+                sort_order=max_order + i + 1,
+            )
+            db.add(sov)
+            added += 1
+        db.commit()
+        return {"success": True, "added": added}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+@router.put("/sov/{sov_id}")
+def update_sov_line(sov_id: int, data: SOVCreate):
+    """Update a SOV line item."""
+    db = get_db()
+    try:
+        line = db.query(SOVLine).get(sov_id)
+        if not line:
+            raise HTTPException(404, "SOV line not found")
+        line.item_number = data.item_number
+        line.description = data.description
+        line.scheduled_value = data.scheduled_value
+        db.commit()
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+@router.delete("/sov/{sov_id}")
+def delete_sov_line(sov_id: int):
+    db = get_db()
+    try:
+        line = db.query(SOVLine).get(sov_id)
+        if not line:
+            raise HTTPException(404)
+        db.delete(line)
+        db.commit()
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+# ─── INVOICES (G702/G703) ───────────────────────────────
+
+class InvoiceCreate(BaseModel):
+    period_from: str = ""
+    period_to: str = ""
+    retainage_pct: float = 10.0
+    notes: str = ""
+
+
+@router.get("/projects/{project_id}/invoices")
+def list_invoices(project_id: int):
+    """List all invoices for a project."""
+    db = get_db()
+    try:
+        invoices = db.query(Invoice).filter(
+            Invoice.project_id == project_id
+        ).order_by(desc(Invoice.application_number)).all()
+        return [{
+            "id": inv.id,
+            "application_number": inv.application_number,
+            "period_from": inv.period_from.isoformat() if inv.period_from else None,
+            "period_to": inv.period_to.isoformat() if inv.period_to else None,
+            "original_contract_sum": inv.original_contract_sum,
+            "net_change_orders": inv.net_change_orders,
+            "contract_sum_to_date": inv.contract_sum_to_date,
+            "retainage_pct": inv.retainage_pct,
+            "total_retainage": inv.total_retainage,
+            "total_completed_and_stored": inv.total_completed_and_stored,
+            "less_previous_certificates": inv.less_previous_certificates,
+            "current_payment_due": inv.current_payment_due,
+            "balance_to_finish": inv.balance_to_finish,
+            "status": inv.status,
+            "submitted_date": inv.submitted_date.isoformat() if inv.submitted_date else None,
+            "notes": inv.notes,
+            "created_at": inv.created_at.isoformat() if inv.created_at else None,
+        } for inv in invoices]
+    finally:
+        db.close()
+
+
+@router.post("/projects/{project_id}/invoices")
+def create_invoice(project_id: int, data: InvoiceCreate):
+    """Create a new pay application from current SOV."""
+    db = get_db()
+    try:
+        # Get SOV lines
+        sov_lines = db.query(SOVLine).filter(
+            SOVLine.project_id == project_id
+        ).order_by(SOVLine.sort_order, SOVLine.id).all()
+        if not sov_lines:
+            raise HTTPException(400, "No Schedule of Values found. Create SOV first.")
+
+        # Determine app number
+        max_app = db.query(func.max(Invoice.application_number)).filter(
+            Invoice.project_id == project_id).scalar() or 0
+        app_num = max_app + 1
+
+        # Calculate previous applications total from prior invoices
+        prev_invoices = db.query(Invoice).filter(
+            Invoice.project_id == project_id,
+            Invoice.application_number < app_num,
+        ).all()
+
+        # Build lookup: sov_line_id -> total completed in previous apps
+        prev_by_sov = {}
+        for prev_inv in prev_invoices:
+            for li in prev_inv.line_items:
+                prev_by_sov[li.sov_line_id] = prev_by_sov.get(li.sov_line_id, 0) + li.this_period + li.materials_stored
+
+        # Original contract sum = sum of all SOV scheduled values
+        original_sum = sum(l.scheduled_value for l in sov_lines)
+        prev_certs = sum(inv.current_payment_due for inv in prev_invoices)
+
+        # Parse dates
+        pf = None
+        pt = None
+        try:
+            if data.period_from: pf = date.fromisoformat(data.period_from)
+            if data.period_to: pt = date.fromisoformat(data.period_to)
+        except: pass
+
+        invoice = Invoice(
+            project_id=project_id,
+            application_number=app_num,
+            period_from=pf,
+            period_to=pt,
+            original_contract_sum=original_sum,
+            net_change_orders=0,
+            contract_sum_to_date=original_sum,
+            retainage_pct=data.retainage_pct,
+            less_previous_certificates=prev_certs,
+            notes=data.notes,
+        )
+        db.add(invoice)
+        db.flush()
+
+        # Create line items for each SOV line
+        for sov in sov_lines:
+            prev_amount = prev_by_sov.get(sov.id, 0)
+            li = InvoiceLineItem(
+                invoice_id=invoice.id,
+                sov_line_id=sov.id,
+                item_number=sov.item_number,
+                description=sov.description,
+                scheduled_value=sov.scheduled_value,
+                previous_applications=prev_amount,
+                this_period=0,
+                materials_stored=0,
+                total_completed=prev_amount,
+                percent_complete=round(prev_amount / sov.scheduled_value * 100, 1) if sov.scheduled_value else 0,
+                balance_to_finish=sov.scheduled_value - prev_amount,
+                retainage=round(prev_amount * data.retainage_pct / 100, 2),
+            )
+            db.add(li)
+
+        db.commit()
+        db.refresh(invoice)
+        return {"success": True, "invoice_id": invoice.id, "application_number": app_num}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+@router.get("/invoices/{invoice_id}")
+def get_invoice(invoice_id: int):
+    """Get full invoice with G703 line items."""
+    db = get_db()
+    try:
+        inv = db.query(Invoice).get(invoice_id)
+        if not inv:
+            raise HTTPException(404, "Invoice not found")
+
+        lines = db.query(InvoiceLineItem).filter(
+            InvoiceLineItem.invoice_id == invoice_id
+        ).order_by(InvoiceLineItem.id).all()
+
+        return {
+            "id": inv.id,
+            "application_number": inv.application_number,
+            "period_from": inv.period_from.isoformat() if inv.period_from else None,
+            "period_to": inv.period_to.isoformat() if inv.period_to else None,
+            "original_contract_sum": inv.original_contract_sum,
+            "net_change_orders": inv.net_change_orders,
+            "contract_sum_to_date": inv.contract_sum_to_date,
+            "retainage_pct": inv.retainage_pct,
+            "retainage_on_completed": inv.retainage_on_completed,
+            "retainage_on_stored": inv.retainage_on_stored,
+            "total_retainage": inv.total_retainage,
+            "total_completed_and_stored": inv.total_completed_and_stored,
+            "less_previous_certificates": inv.less_previous_certificates,
+            "current_payment_due": inv.current_payment_due,
+            "balance_to_finish": inv.balance_to_finish,
+            "status": inv.status,
+            "notes": inv.notes,
+            "line_items": [{
+                "id": li.id,
+                "sov_line_id": li.sov_line_id,
+                "item_number": li.item_number,
+                "description": li.description,
+                "scheduled_value": li.scheduled_value,
+                "previous_applications": li.previous_applications,
+                "this_period": li.this_period,
+                "materials_stored": li.materials_stored,
+                "total_completed": li.total_completed,
+                "percent_complete": li.percent_complete,
+                "balance_to_finish": li.balance_to_finish,
+                "retainage": li.retainage,
+            } for li in lines],
+        }
+    finally:
+        db.close()
+
+
+class LineItemUpdate(BaseModel):
+    this_period: float = 0
+    materials_stored: float = 0
+
+
+@router.put("/invoices/{invoice_id}/lines")
+def update_invoice_lines(invoice_id: int, updates: dict = Body(...)):
+    """Update G703 line items. Body: {line_item_id: {this_period, materials_stored}, ...}"""
+    db = get_db()
+    try:
+        inv = db.query(Invoice).get(invoice_id)
+        if not inv:
+            raise HTTPException(404, "Invoice not found")
+
+        total_completed = 0
+        total_retainage_completed = 0
+        total_retainage_stored = 0
+
+        lines = db.query(InvoiceLineItem).filter(
+            InvoiceLineItem.invoice_id == invoice_id
+        ).all()
+
+        for li in lines:
+            key = str(li.id)
+            if key in updates:
+                u = updates[key]
+                li.this_period = u.get("this_period", li.this_period)
+                li.materials_stored = u.get("materials_stored", li.materials_stored)
+
+            # Recalculate
+            li.total_completed = li.previous_applications + li.this_period + li.materials_stored
+            li.percent_complete = round(li.total_completed / li.scheduled_value * 100, 1) if li.scheduled_value else 0
+            li.balance_to_finish = li.scheduled_value - li.total_completed
+            li.retainage = round(li.total_completed * inv.retainage_pct / 100, 2)
+
+            total_completed += li.total_completed
+            work_done = li.previous_applications + li.this_period
+            total_retainage_completed += round(work_done * inv.retainage_pct / 100, 2)
+            total_retainage_stored += round(li.materials_stored * inv.retainage_pct / 100, 2)
+
+        # Update G702 summary
+        inv.total_completed_and_stored = total_completed
+        inv.retainage_on_completed = total_retainage_completed
+        inv.retainage_on_stored = total_retainage_stored
+        inv.total_retainage = total_retainage_completed + total_retainage_stored
+        inv.balance_to_finish = inv.contract_sum_to_date - total_completed
+        inv.current_payment_due = total_completed - inv.total_retainage - inv.less_previous_certificates
+
+        db.commit()
+        return {"success": True, "current_payment_due": inv.current_payment_due}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+@router.put("/invoices/{invoice_id}/change-orders")
+def update_change_orders(invoice_id: int, net_change_orders: float = Form(...)):
+    """Update net change order amount on G702."""
+    db = get_db()
+    try:
+        inv = db.query(Invoice).get(invoice_id)
+        if not inv:
+            raise HTTPException(404)
+        inv.net_change_orders = net_change_orders
+        inv.contract_sum_to_date = inv.original_contract_sum + net_change_orders
+        inv.balance_to_finish = inv.contract_sum_to_date - inv.total_completed_and_stored
+        inv.current_payment_due = inv.total_completed_and_stored - inv.total_retainage - inv.less_previous_certificates
+        db.commit()
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+@router.put("/invoices/{invoice_id}/submit")
+def submit_invoice(invoice_id: int):
+    """Mark invoice as submitted."""
+    db = get_db()
+    try:
+        inv = db.query(Invoice).get(invoice_id)
+        if not inv:
+            raise HTTPException(404)
+        inv.status = "submitted"
+        inv.submitted_date = date.today()
+        db.commit()
+        return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+@router.put("/invoices/{invoice_id}/approve")
+def approve_invoice(invoice_id: int):
+    db = get_db()
+    try:
+        inv = db.query(Invoice).get(invoice_id)
+        if not inv: raise HTTPException(404)
+        inv.status = "approved"
+        db.commit()
+        return {"success": True}
+    except HTTPException: raise
+    finally: db.close()
+
+
+@router.put("/invoices/{invoice_id}/paid")
+def mark_invoice_paid(invoice_id: int):
+    db = get_db()
+    try:
+        inv = db.query(Invoice).get(invoice_id)
+        if not inv: raise HTTPException(404)
+        inv.status = "paid"
+        db.commit()
+        return {"success": True}
+    except HTTPException: raise
+    finally: db.close()
+
+
+@router.delete("/invoices/{invoice_id}")
+def delete_invoice(invoice_id: int):
+    db = get_db()
+    try:
+        inv = db.query(Invoice).get(invoice_id)
+        if not inv: raise HTTPException(404)
+        if inv.status != "draft":
+            raise HTTPException(400, "Can only delete draft invoices")
+        db.delete(inv)
+        db.commit()
+        return {"success": True}
+    except HTTPException: raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    finally: db.close()

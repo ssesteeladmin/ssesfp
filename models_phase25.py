@@ -448,6 +448,78 @@ class ProductionFolderItem(Base):
     )
 
 
+# ═══════════════════════════════════════════════════════════════
+#  AIA G702/G703 INVOICING
+# ═══════════════════════════════════════════════════════════════
+
+class SOVLine(Base):
+    """Schedule of Values line item (G703 rows)."""
+    __tablename__ = "tracker_sov_lines"
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("tracker_projects.id"), nullable=False)
+    item_number = Column(String(20), nullable=False)  # 1, 2, 3... or 1A, 1B
+    description = Column(String(500), nullable=False)
+    scheduled_value = Column(Float, nullable=False, default=0)  # Column C
+    sort_order = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    __table_args__ = (
+        Index("idx_sov_project", "project_id"),
+    )
+
+
+class Invoice(Base):
+    """AIA G702 Application for Payment."""
+    __tablename__ = "tracker_invoices"
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, ForeignKey("tracker_projects.id"), nullable=False)
+    application_number = Column(Integer, nullable=False)  # App #1, #2, #3...
+    period_from = Column(Date)
+    period_to = Column(Date)
+    # G702 Header
+    original_contract_sum = Column(Float, default=0)  # Line 1
+    net_change_orders = Column(Float, default=0)  # Line 2
+    contract_sum_to_date = Column(Float, default=0)  # Line 3 (1+2)
+    retainage_pct = Column(Float, default=10.0)  # Retainage percentage
+    retainage_on_completed = Column(Float, default=0)  # 5a
+    retainage_on_stored = Column(Float, default=0)  # 5b
+    total_retainage = Column(Float, default=0)  # 5a + 5b
+    total_completed_and_stored = Column(Float, default=0)  # Line 4 (sum of G703 col G)
+    less_previous_certificates = Column(Float, default=0)  # Line 6
+    current_payment_due = Column(Float, default=0)  # Line 7 (4 - 5 - 6)
+    balance_to_finish = Column(Float, default=0)  # Line 8 (3 - 4)
+    status = Column(String(30), default="draft")  # draft, submitted, approved, paid
+    submitted_date = Column(Date, nullable=True)
+    notes = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    line_items = relationship("InvoiceLineItem", back_populates="invoice", cascade="all, delete-orphan")
+    __table_args__ = (
+        Index("idx_invoice_project", "project_id"),
+    )
+
+
+class InvoiceLineItem(Base):
+    """G703 continuation sheet line for a specific application."""
+    __tablename__ = "tracker_invoice_line_items"
+    id = Column(Integer, primary_key=True)
+    invoice_id = Column(Integer, ForeignKey("tracker_invoices.id"), nullable=False)
+    sov_line_id = Column(Integer, ForeignKey("tracker_sov_lines.id"), nullable=False)
+    item_number = Column(String(20))  # copied from SOV
+    description = Column(String(500))  # copied from SOV
+    scheduled_value = Column(Float, default=0)  # Column C
+    previous_applications = Column(Float, default=0)  # Column D (sum of prior apps)
+    this_period = Column(Float, default=0)  # Column E (work this period)
+    materials_stored = Column(Float, default=0)  # Column F
+    total_completed = Column(Float, default=0)  # Column G (D + E + F)
+    percent_complete = Column(Float, default=0)  # Column G/C (%)
+    balance_to_finish = Column(Float, default=0)  # Column H (C - G)
+    retainage = Column(Float, default=0)  # Column I
+    invoice = relationship("Invoice", back_populates="line_items")
+    __table_args__ = (
+        Index("idx_inv_line_invoice", "invoice_id"),
+    )
+
+
 def generate_barcode():
     """Generate a unique barcode string"""
     return f"SSE-{uuid.uuid4().hex[:8].upper()}"
