@@ -1254,12 +1254,15 @@ def scan_to_load(data: ScanToLoadCreate):
         if not assembly:
             raise HTTPException(404, "Assembly not found")
         
-        # Check not already on a load
-        existing = db.query(ShipmentItem).filter(
+        # Check qty limit: count how many times this assembly is already on loads
+        existing_count = db.query(ShipmentItem).filter(
             ShipmentItem.assembly_id == data.assembly_id
-        ).first()
-        if existing:
-            raise HTTPException(400, f"Assembly already on Load #{db.query(Shipment).get(existing.shipment_id).load_number}")
+        ).count()
+        max_qty = assembly.assembly_quantity or 1
+        if existing_count >= max_qty:
+            existing = db.query(ShipmentItem).filter(ShipmentItem.assembly_id == data.assembly_id).first()
+            load_num = db.query(Shipment).get(existing.shipment_id).load_number if existing else '?'
+            raise HTTPException(400, f"{assembly.assembly_mark} already loaded ({existing_count}/{max_qty}) — Load #{load_num}")
         
         item = ShipmentItem(
             shipment_id=data.shipment_id,
@@ -1336,12 +1339,14 @@ def list_shipments(project_id: int):
 
 @app.get("/api/projects/{project_id}/shippable-assemblies")
 def get_shippable_assemblies(project_id: int):
-    """Get assemblies that can be added to a load (not already on one)."""
+    """Get assemblies that can be added to a load (not fully loaded)."""
     db = SessionLocal()
     try:
-        # Get all assembly IDs already on a shipment
-        on_loads = set(
-            r[0] for r in db.query(ShipmentItem.assembly_id).all() if r[0]
+        # Count how many times each assembly is on a load
+        from sqlalchemy import func as sqlfunc
+        loaded_counts = dict(
+            db.query(ShipmentItem.assembly_id, sqlfunc.count(ShipmentItem.id))
+            .group_by(ShipmentItem.assembly_id).all()
         )
         assemblies = db.query(Assembly).filter(
             Assembly.project_id == project_id
@@ -1349,15 +1354,19 @@ def get_shippable_assemblies(project_id: int):
 
         result = []
         for a in assemblies:
+            qty = a.assembly_quantity or 1
+            loaded = loaded_counts.get(a.id, 0)
             result.append({
                 "id": a.id,
                 "assembly_mark": a.assembly_mark,
                 "assembly_name": a.assembly_name or "",
-                "assembly_quantity": a.assembly_quantity or 1,
+                "assembly_quantity": qty,
                 "weight": a.assembly_weight or 0,
                 "current_station": a.current_station or "",
                 "finish_type": a.finish_type or "",
-                "on_load": a.id in on_loads,
+                "loaded_qty": loaded,
+                "remaining_qty": max(0, qty - loaded),
+                "fully_loaded": loaded >= qty,
             })
         return result
     finally:

@@ -15,7 +15,7 @@ from sqlalchemy import desc, func, or_
 from sqlalchemy.orm import Session
 
 from models import (
-    Base, Project, Assembly, Part, Drawing, ScanEvent
+    Base, Project, Assembly, Part, Drawing, ScanEvent, ChangeOrder
 )
 from models_phase25 import (
     Vendor, NestRun, NestRunItem, NestRunDrop,
@@ -3462,6 +3462,12 @@ def create_invoice(project_id: int, data: InvoiceCreate):
         original_sum = sum(l.scheduled_value for l in sov_lines)
         prev_certs = sum(inv.current_payment_due for inv in prev_invoices)
 
+        # Calculate net change orders from approved COs
+        net_cos = db.query(func.sum(ChangeOrder.cost_impact)).filter(
+            ChangeOrder.project_id == project_id,
+            ChangeOrder.status == "Approved"
+        ).scalar() or 0
+
         # Parse dates
         pf = None
         pt = None
@@ -3476,8 +3482,8 @@ def create_invoice(project_id: int, data: InvoiceCreate):
             period_from=pf,
             period_to=pt,
             original_contract_sum=original_sum,
-            net_change_orders=0,
-            contract_sum_to_date=original_sum,
+            net_change_orders=net_cos,
+            contract_sum_to_date=original_sum + net_cos,
             retainage_pct=data.retainage_pct,
             less_previous_certificates=prev_certs,
             notes=data.notes,
@@ -3711,3 +3717,391 @@ def delete_invoice(invoice_id: int):
         db.rollback()
         raise HTTPException(500, str(e))
     finally: db.close()
+
+
+# ─── CHANGE ORDERS ──────────────────────────────────────
+
+class COCreate(BaseModel):
+    description: str
+    amount: float = 0
+    status: str = "Draft"
+    date_submitted: str = ""
+    notes: str = ""
+
+
+@router.get("/projects/{project_id}/change-orders")
+def list_change_orders(project_id: int):
+    db = get_db()
+    try:
+        cos = db.query(ChangeOrder).filter(
+            ChangeOrder.project_id == project_id
+        ).order_by(ChangeOrder.co_number).all()
+        return [{
+            "id": co.id,
+            "co_number": co.co_number,
+            "description": co.title or co.description or "",
+            "amount": co.cost_impact or 0,
+            "status": co.status,
+            "date_submitted": co.submitted_date.isoformat() if co.submitted_date else None,
+            "date_approved": co.approved_date.isoformat() if co.approved_date else None,
+            "notes": co.description or "",
+        } for co in cos]
+    finally:
+        db.close()
+
+
+@router.post("/projects/{project_id}/change-orders")
+def create_change_order(project_id: int, data: COCreate):
+    db = get_db()
+    try:
+        max_num = db.query(func.max(ChangeOrder.id)).filter(
+            ChangeOrder.project_id == project_id).scalar() or 0
+        ds = None
+        try:
+            if data.date_submitted: ds = date.fromisoformat(data.date_submitted)
+        except: pass
+        co = ChangeOrder(
+            project_id=project_id,
+            co_number=str(max_num + 1),
+            title=data.description,
+            cost_impact=data.amount,
+            status=data.status,
+            submitted_date=ds,
+            description=data.notes,
+        )
+        db.add(co)
+        db.commit()
+        db.refresh(co)
+        return {"success": True, "id": co.id, "co_number": co.co_number}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+@router.put("/change-orders/{co_id}")
+def update_change_order(co_id: int, data: COCreate):
+    db = get_db()
+    try:
+        co = db.query(ChangeOrder).get(co_id)
+        if not co: raise HTTPException(404)
+        co.title = data.description
+        co.cost_impact = data.amount
+        co.status = data.status
+        co.description = data.notes
+        try:
+            if data.date_submitted: co.submitted_date = date.fromisoformat(data.date_submitted)
+        except: pass
+        if data.status == "Approved" and not co.approved_date:
+            co.approved_date = date.today()
+        db.commit()
+        return {"success": True}
+    except HTTPException: raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
+    finally:
+        db.close()
+
+
+@router.delete("/change-orders/{co_id}")
+def delete_change_order(co_id: int):
+    db = get_db()
+    try:
+        co = db.query(ChangeOrder).get(co_id)
+        if not co: raise HTTPException(404)
+        db.delete(co)
+        db.commit()
+        return {"success": True}
+    except HTTPException: raise
+    finally: db.close()
+
+
+@router.get("/projects/{project_id}/approved-co-total")
+def get_approved_co_total(project_id: int):
+    """Get net total of approved change orders."""
+    db = get_db()
+    try:
+        total = db.query(func.sum(ChangeOrder.cost_impact)).filter(
+            ChangeOrder.project_id == project_id,
+            ChangeOrder.status == "Approved"
+        ).scalar() or 0
+        return {"total": total}
+    finally:
+        db.close()
+
+
+# ─── AIA G702/G703 PDF EXPORT ───────────────────────────
+
+@router.get("/invoices/{invoice_id}/pdf")
+def export_invoice_pdf(invoice_id: int):
+    """Generate official AIA G702/G703 PDF."""
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.units import inch
+    from reportlab.pdfgen import canvas
+    from reportlab.lib import colors
+    import io
+    from starlette.responses import StreamingResponse
+
+    db = get_db()
+    try:
+        inv = db.query(Invoice).get(invoice_id)
+        if not inv: raise HTTPException(404)
+
+        # Get project info
+        from models import Project
+        project = db.query(Project).get(inv.project_id)
+
+        lines = db.query(InvoiceLineItem).filter(
+            InvoiceLineItem.invoice_id == invoice_id
+        ).order_by(InvoiceLineItem.id).all()
+
+        # Get change orders for this project
+        cos = db.query(ChangeOrder).filter(
+            ChangeOrder.project_id == inv.project_id,
+            ChangeOrder.status == "Approved"
+        ).order_by(ChangeOrder.co_number).all()
+
+        buf = io.BytesIO()
+        w, h = letter
+        c = canvas.Canvas(buf, pagesize=letter)
+
+        def fmt(n):
+            if n is None: n = 0
+            neg = n < 0
+            s = f"${abs(n):,.2f}"
+            return f"({s})" if neg else s
+
+        def draw_box(x, y, width, height, label="", value="", bold_value=False):
+            c.setStrokeColor(colors.black)
+            c.setLineWidth(0.5)
+            c.rect(x, y, width, height)
+            if label:
+                c.setFont("Helvetica", 6)
+                c.drawString(x + 2, y + height - 8, label)
+            if value:
+                c.setFont("Helvetica-Bold" if bold_value else "Helvetica", 9)
+                c.drawString(x + 4, y + 3, str(value))
+
+        # ═══ PAGE 1: G702 ═══
+        c.setFont("Helvetica-Bold", 14)
+        c.drawCentredString(w/2, h - 36, "AIA DOCUMENT G702")
+        c.setFont("Helvetica", 8)
+        c.drawCentredString(w/2, h - 48, "APPLICATION AND CERTIFICATE FOR PAYMENT")
+
+        # Header boxes
+        top = h - 65
+        left = 36
+        col2 = w/2 + 18
+        bw = w/2 - 54  # box width
+        bh = 36
+
+        draw_box(left, top - bh, bw, bh, "TO OWNER:", project.customer if project else "")
+        draw_box(col2, top - bh, bw, bh, "APPLICATION NO:", str(inv.application_number))
+
+        draw_box(left, top - bh*2, bw, bh, "FROM CONTRACTOR:", "SSE - Steel Structural Engineering")
+        draw_box(col2, top - bh*2, bw, bh, "PERIOD FROM:", inv.period_from.isoformat() if inv.period_from else "")
+
+        draw_box(left, top - bh*3, bw, bh, "PROJECT:", f"{project.job_number} - {project.name}" if project else "")
+        draw_box(col2, top - bh*3, bw, bh, "PERIOD TO:", inv.period_to.isoformat() if inv.period_to else "")
+
+        draw_box(left, top - bh*4, bw, bh, "CONTRACT FOR:", "Structural Steel Fabrication")
+        draw_box(col2, top - bh*4, bw, bh, "CONTRACT DATE:", "")
+
+        # Contractor's Application section
+        sy = top - bh*4 - 30
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(left, sy, "CONTRACTOR'S APPLICATION FOR PAYMENT")
+
+        # G702 Line items
+        ly = sy - 20
+        lh = 22
+        numW = 24
+        descW = bw + 60
+        valW = w - 36 - left - numW - descW - 10
+
+        g702_lines = [
+            ("1.", "ORIGINAL CONTRACT SUM", fmt(inv.original_contract_sum)),
+            ("2.", "Net change by Change Orders", fmt(inv.net_change_orders)),
+            ("3.", "CONTRACT SUM TO DATE (Line 1 + 2)", fmt(inv.contract_sum_to_date)),
+            ("4.", "TOTAL COMPLETED & STORED TO DATE", fmt(inv.total_completed_and_stored)),
+            ("", "(Column G on G703)", ""),
+            ("5a.", f"Retainage: {inv.retainage_pct}% of Completed Work", fmt(inv.retainage_on_completed)),
+            ("5b.", f"Retainage: {inv.retainage_pct}% of Stored Material", fmt(inv.retainage_on_stored)),
+            ("", "TOTAL RETAINAGE (Lines 5a + 5b)", fmt(inv.total_retainage)),
+            ("6.", "TOTAL EARNED LESS RETAINAGE", fmt(inv.total_completed_and_stored - inv.total_retainage)),
+            ("7.", "LESS PREVIOUS CERTIFICATES FOR PAYMENT", fmt(inv.less_previous_certificates)),
+            ("8.", "CURRENT PAYMENT DUE", fmt(inv.current_payment_due)),
+            ("9.", "BALANCE TO FINISH, INCLUDING RETAINAGE", fmt(inv.balance_to_finish + inv.total_retainage)),
+        ]
+
+        for i, (num, desc, val) in enumerate(g702_lines):
+            y = ly - (i * lh)
+            is_total = num in ("8.", "") and "TOTAL" in desc
+            is_payment = num == "8."
+            c.setStrokeColor(colors.black)
+            c.setLineWidth(0.5)
+            c.rect(left, y - lh + 4, w - 72, lh)
+
+            c.setFont("Helvetica-Bold" if is_payment else "Helvetica", 8)
+            c.drawString(left + 3, y - 8, num)
+            c.drawString(left + numW, y - 8, desc)
+
+            if val:
+                c.setFont("Helvetica-Bold" if is_payment else "Helvetica", 9)
+                c.drawRightString(w - 42, y - 8, val)
+
+        # Change orders summary if any
+        if cos:
+            coy = ly - (len(g702_lines) * lh) - 20
+            c.setFont("Helvetica-Bold", 8)
+            c.drawString(left, coy, "CHANGE ORDER SUMMARY:")
+            c.setFont("Helvetica", 7)
+            for i, co in enumerate(cos):
+                c.drawString(left + 10, coy - 12 - (i * 11),
+                    f"CO #{co.co_number}: {co.title} — {fmt(co.cost_impact)} ({co.status})")
+
+        # Signature lines
+        sig_y = 80
+        c.setLineWidth(0.5)
+        c.line(left, sig_y, left + 200, sig_y)
+        c.line(w/2 + 20, sig_y, w - 36, sig_y)
+        c.setFont("Helvetica", 7)
+        c.drawString(left, sig_y - 10, "Contractor Signature & Date")
+        c.drawString(w/2 + 20, sig_y - 10, "Owner Signature & Date")
+
+        c.showPage()
+
+        # ═══ PAGE 2+: G703 Continuation Sheet ═══
+        def draw_g703_header(page_num=1):
+            c.setFont("Helvetica-Bold", 12)
+            c.drawCentredString(w/2, h - 30, "AIA DOCUMENT G703 — CONTINUATION SHEET")
+            c.setFont("Helvetica", 7)
+            c.drawCentredString(w/2, h - 42, f"Application No: {inv.application_number} | "
+                f"Application Date: {inv.period_to.isoformat() if inv.period_to else ''} | "
+                f"Project: {project.job_number if project else ''} - {project.name if project else ''}")
+            if page_num > 1:
+                c.drawRightString(w - 36, h - 42, f"Page {page_num}")
+
+        # Column definitions for G703
+        cols = [
+            ("A", "Item\nNo.", 30),
+            ("B", "Description of Work", 140),
+            ("C", "Scheduled\nValue", 72),
+            ("D", "Work Completed\nPrevious Apps", 72),
+            ("E", "Work Completed\nThis Period", 72),
+            ("F", "Materials\nStored", 62),
+            ("G", "Total\nCompleted", 72),
+            ("G/C", "%", 28),
+            ("H", "Balance To\nFinish", 72),
+        ]
+
+        def draw_g703_table_header(y):
+            x = left
+            c.setFillColor(colors.Color(0.9, 0.9, 0.9))
+            c.rect(left, y - 28, w - 72, 28, fill=1)
+            c.setFillColor(colors.black)
+            c.setFont("Helvetica-Bold", 6)
+            for col_letter, col_name, col_w in cols:
+                c.drawCentredString(x + col_w/2, y - 10, col_letter)
+                c.setFont("Helvetica", 5)
+                for j, line in enumerate(col_name.split("\n")):
+                    c.drawCentredString(x + col_w/2, y - 18 - (j * 7), line)
+                c.setFont("Helvetica-Bold", 6)
+                c.setStrokeColor(colors.black)
+                c.setLineWidth(0.3)
+                c.line(x, y, x, y - 28)
+                x += col_w
+            c.line(x, y, x, y - 28)
+            c.rect(left, y - 28, w - 72, 28)
+            return y - 28
+
+        draw_g703_header(1)
+        table_y = draw_g703_table_header(h - 55)
+        row_h = 14
+        rows_per_page = int((table_y - 80) / row_h)
+        row_count = 0
+        page_num = 1
+
+        totals = {"scheduled": 0, "prev": 0, "this": 0, "stored": 0, "total": 0, "balance": 0}
+
+        for li in lines:
+            if row_count >= rows_per_page:
+                # Draw page totals and start new page
+                c.showPage()
+                page_num += 1
+                draw_g703_header(page_num)
+                table_y = draw_g703_table_header(h - 55)
+                row_count = 0
+
+            y = table_y - (row_count * row_h)
+            x = left
+
+            row_data = [
+                (li.item_number, 30, "center"),
+                (li.description[:30], 140, "left"),
+                (fmt(li.scheduled_value), 72, "right"),
+                (fmt(li.previous_applications), 72, "right"),
+                (fmt(li.this_period), 72, "right"),
+                (fmt(li.materials_stored), 62, "right"),
+                (fmt(li.total_completed), 72, "right"),
+                (f"{li.percent_complete:.0f}%", 28, "center"),
+                (fmt(li.balance_to_finish), 72, "right"),
+            ]
+
+            c.setLineWidth(0.3)
+            for val, col_w, align in row_data:
+                c.line(x, y, x, y - row_h)
+                c.setFont("Helvetica", 6)
+                if align == "right":
+                    c.drawRightString(x + col_w - 3, y - 10, str(val))
+                elif align == "center":
+                    c.drawCentredString(x + col_w/2, y - 10, str(val))
+                else:
+                    c.drawString(x + 2, y - 10, str(val))
+                x += col_w
+            c.line(x, y, x, y - row_h)
+            c.line(left, y - row_h, x, y - row_h)
+
+            totals["scheduled"] += li.scheduled_value
+            totals["prev"] += li.previous_applications
+            totals["this"] += li.this_period
+            totals["stored"] += li.materials_stored
+            totals["total"] += li.total_completed
+            totals["balance"] += li.balance_to_finish
+            row_count += 1
+
+        # Totals row
+        y = table_y - (row_count * row_h)
+        x = left
+        c.setFillColor(colors.Color(0.93, 0.93, 0.93))
+        c.rect(left, y - row_h - 2, w - 72, row_h + 2, fill=1)
+        c.setFillColor(colors.black)
+
+        total_data = [
+            ("", 30), ("GRAND TOTAL", 140),
+            (fmt(totals["scheduled"]), 72), (fmt(totals["prev"]), 72),
+            (fmt(totals["this"]), 72), (fmt(totals["stored"]), 62),
+            (fmt(totals["total"]), 72), ("", 28),
+            (fmt(totals["balance"]), 72),
+        ]
+        for val, col_w in total_data:
+            c.setFont("Helvetica-Bold", 6)
+            if val and val.startswith("$"):
+                c.drawRightString(x + col_w - 3, y - 10, val)
+            elif val:
+                c.drawString(x + 2, y - 10, val)
+            x += col_w
+
+        c.save()
+        buf.seek(0)
+
+        filename = f"AIA_G702_G703_App{inv.application_number}_{project.job_number if project else 'unknown'}.pdf"
+        return StreamingResponse(
+            buf,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+    finally:
+        db.close()
