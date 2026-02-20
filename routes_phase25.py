@@ -1144,6 +1144,15 @@ def create_manual_po(project_id: int, data: ManualPOCreate):
             db.add(poi)
 
         db.commit()
+        
+        # Push to production receiving dashboard
+        try:
+            vendor_name = vendor.name if vendor else 'Unknown'
+            db.execute(text("INSERT INTO receiving_orders (job_number, po_number, vendor, pm, description, status, source, created_by) VALUES (:job, :po, :vendor, :pm, :desc, 'open', 'ssesfp', 'ssesfp')"), {"job": project.job_number, "po": po_number, "vendor": vendor_name, "pm": data.ordered_by or '', "desc": f'PO from {vendor_name} - {line} items'})
+            db.commit()
+            print(f'Receiving order created for {po_number}')
+        except Exception as recv_err:
+            print(f'Receiving insert failed (non-fatal): {recv_err}')
         return {"po_id": po.id, "po_number": po_number, "items": line}
     finally:
         db.close()
