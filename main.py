@@ -1754,11 +1754,11 @@ def generate_po_from_cutlist(project_id: int, vendor_id: int = Form(...)):
                 "source": "ssesfp",
                 "created_by": "ssesfp"
             }
-            xpost = httpx.Client(timeout=10)
-            xpost.post("https://ssesteeldashboard.up.railway.app/api/v1/receiving", json=receiving_data)
-            xpost.close()
-        except Exception as cross_err:
-            print(f"Receiving cross-post failed (non-fatal): {cross_err}")
+            db.execute(text("INSERT INTO receiving_orders (job_number, po_number, vendor, pm, description, status, source, created_by) VALUES (:job, :po, :vendor, :pm, :desc, 'open', 'ssesfp', 'ssesfp')"), {"job": project.job_number, "po": po_number, "vendor": vendor_name, "pm": "", "desc": f"PO from {vendor_name} - {len(parts)} items"})
+            db.commit()
+            print(f"Receiving order created for {po_number}")
+        except Exception as recv_err:
+            print(f"Receiving insert failed (non-fatal): {recv_err}")
         
         return {"po_id": po.id, "po_number": po_number}
     finally:
