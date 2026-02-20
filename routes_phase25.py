@@ -11,6 +11,7 @@ from datetime import datetime, date
 from typing import Optional, List
 from fastapi import APIRouter, HTTPException, Form, Query, UploadFile, File, Body
 from pydantic import BaseModel
+import httpx
 from sqlalchemy import desc, func, or_, text
 from sqlalchemy.orm import Session
 
@@ -1144,6 +1145,25 @@ def create_manual_po(project_id: int, data: ManualPOCreate):
             db.add(poi)
 
         db.commit()
+        
+        # Push to production receiving dashboard
+        try:
+            vendor_name = vendor.name if vendor else 'Unknown'
+            xc = httpx.Client(timeout=10)
+            xc.post("https://ssesteeldashboard.up.railway.app/api/v1/receiving", json={
+                "job_number": project.job_number,
+                "po_number": po_number,
+                "vendor": vendor_name,
+                "pm": data.ordered_by or "",
+                "description": "PO from " + vendor_name + " - " + str(line) + " items",
+                "status": "open",
+                "source": "ssesfp",
+                "created_by": "ssesfp"
+            })
+            xc.close()
+            print('Receiving: pushed ' + po_number)
+        except Exception as rx:
+            print('Receiving push failed: ' + str(rx))
         return {"po_id": po.id, "po_number": po_number, "items": line}
     finally:
         db.close()
