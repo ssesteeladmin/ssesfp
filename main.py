@@ -1738,6 +1738,28 @@ def generate_po_from_cutlist(project_id: int, vendor_id: int = Form(...)):
             db.add(item)
         
         db.commit()
+        
+        # Cross-post to production receiving dashboard
+        try:
+            vendor = db.query(Company).get(vendor_id)
+            vendor_name = vendor.name if vendor else "Unknown"
+            receiving_data = {
+                "job_number": project.job_number,
+                "po_number": po_number,
+                "vendor": vendor_name,
+                "pm": "",
+                "description": f"PO from {vendor_name} - {len(parts)} items",
+                "date_expected": "",
+                "status": "open",
+                "source": "ssesfp",
+                "created_by": "ssesfp"
+            }
+            xpost = httpx.Client(timeout=10)
+            xpost.post("https://ssesteeldashboard.up.railway.app/api/v1/receiving", json=receiving_data)
+            xpost.close()
+        except Exception as cross_err:
+            print(f"Receiving cross-post failed (non-fatal): {cross_err}")
+        
         return {"po_id": po.id, "po_number": po_number}
     finally:
         db.close()
