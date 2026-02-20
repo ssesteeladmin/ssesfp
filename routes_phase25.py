@@ -1144,6 +1144,26 @@ def create_manual_po(project_id: int, data: ManualPOCreate):
             db.add(poi)
 
         db.commit()
+        
+        # Push to production receiving dashboard
+        try:
+            vendor_name = vendor.name if vendor else 'Unknown'
+            import json as _json
+            _payload = _json.dumps({
+                "job_number": project.job_number,
+                "po_number": po_number,
+                "vendor": vendor_name,
+                "pm": data.ordered_by or "",
+                "description": "PO from " + vendor_name + " - " + str(line) + " items",
+                "status": "open",
+                "source": "ssesfp",
+                "created_by": "ssesfp"
+            }).encode('utf-8')
+            _req = urllib.request.Request("https://ssesteeldashboard.up.railway.app/api/v1/receiving", data=_payload, headers={"Content-Type": "application/json"}, method="POST")
+            urllib.request.urlopen(_req, timeout=10)
+            print('Receiving: pushed ' + po_number)
+        except Exception as rx:
+            print('Receiving push failed: ' + str(rx))
         return {"po_id": po.id, "po_number": po_number, "items": line}
     finally:
         db.close()
