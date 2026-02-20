@@ -11,7 +11,7 @@ from datetime import datetime, date
 from typing import Optional, List
 from fastapi import APIRouter, HTTPException, Form, Query, UploadFile, File, Body
 from pydantic import BaseModel
-from sqlalchemy import desc, func, or_
+from sqlalchemy import desc, func, or_, text
 from sqlalchemy.orm import Session
 
 from models import (
